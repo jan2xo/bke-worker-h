@@ -60,3 +60,6 @@ jobs:
           python3 tests/cloudflare_relay_contract.py
           node --test tests/admin_preproduction_activation.test.mjs
           bash tests/chrome_native_host_installer_contract.sh
+          bash scripts/package-desktop-worker.sh package --out "$RUNNER_TEMP/desktop-pkg"
+          bash scripts/package-desktop-worker.sh verify --out "$RUNNER_TEMP/desktop-pkg"
+          bash scripts/package-desktop-worker.sh clean-uninstall --out "$RUNNER_TEMP/desktop-pkg"

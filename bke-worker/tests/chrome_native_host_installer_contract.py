@@ -43,8 +43,12 @@ with tempfile.TemporaryDirectory(prefix="bke-installer-contract-") as td:
     home.mkdir(mode=0o700); sandbox.mkdir(mode=0o700)
     for d in (temp, fake, home, sandbox, sandbox/"policy"):
         if d.exists(): d.chmod(0o700)
+    real_node=subprocess.check_output(["node","-p",'require("node:fs").realpathSync(process.execPath)'],text=True).strip()
+    safe_node_dir=temp/"safe-node"; safe_node_dir.mkdir(mode=0o700); safe_node_dir.chmod(0o700)
+    safe_node=safe_node_dir/"node"; shutil.copy2(real_node,safe_node); safe_node.chmod(0o700)
     env={**os.environ,"HOME":str(home),"BKE_NATIVE_HOST_TEST_ROOT":str(sandbox),
          "BKE_NATIVE_HOST_TEST_OS":"Linux",
+         "BKE_NATIVE_HOST_TEST_NODE_PATH":str(safe_node),
          "BKE_NATIVE_HOST_EXTENSION_ORIGIN":"chrome-extension://"+"a"*32+"/"}
     registration_dir=sandbox/"xdg/google-chrome/NativeMessagingHosts"
     manifest_path=registration_dir/"bke.worker.desktop.json"
@@ -82,10 +86,11 @@ with tempfile.TemporaryDirectory(prefix="bke-installer-contract-") as td:
     assert r.returncode==0 and str(manifest_path) in r.stdout,(r.stdout,r.stderr)
     assert not manifest_path.exists()
     assert not (sandbox/"chrome").exists()
-    # Unsafe Node executable paths are rejected before any operator state is prepared.
-    real_node=subprocess.check_output(["node","-p",'require("node:fs").realpathSync(process.execPath)'],text=True).strip()
+    # Unsafe Node executable paths (missing, symlink, group-writable 0o775, world-writable 0o777) are rejected.
     node_link=sandbox/"node-link"; node_link.symlink_to(real_node)
-    for node_candidate in (str(sandbox/"node-does-not-exist"),str(node_link)):
+    group_writable_node=temp/"unsafe-node-775"; shutil.copy2(real_node,group_writable_node); group_writable_node.chmod(0o775)
+    world_writable_node=temp/"unsafe-node-777"; shutil.copy2(real_node,world_writable_node); world_writable_node.chmod(0o777)
+    for node_candidate in (str(sandbox/"node-does-not-exist"),str(node_link),str(group_writable_node),str(world_writable_node)):
         node_env={**env,"BKE_NATIVE_HOST_TEST_NODE_PATH":node_candidate}
         r=subprocess.run(cmd+["inspect"],cwd="/",env=node_env,capture_output=True,text=True)
         assert r.returncode!=0 and "Node executable validation failed" in r.stderr

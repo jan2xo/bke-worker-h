@@ -5,23 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    plugins: [
-      react(),
-      tailwindcss(),
-      {
-        name: 'patch-attachment-headers',
-        configureServer(server) {
-          server.middlewares.use('/bke-worker-f1-completion.patch', (_req, res, next) => {
-            res.setHeader('Content-Type', 'text/x-patch; charset=utf-8');
-            res.setHeader(
-              'Content-Disposition',
-              'attachment; filename="bke-worker-f1-completion.patch"',
-            );
-            next();
-          });
-        },
-      },
-    ],
+    plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
