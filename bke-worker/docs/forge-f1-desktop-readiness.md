@@ -1,0 +1,60 @@
+# FORGE F1-01 — desktop Chrome readiness
+
+## Purpose
+
+The one-command owner entrypoint is:
+
+    bash scripts/forge-f1-desktop-readiness.sh
+
+Run it from a clean checkout of the canonical jan2xo/bke-worker main. It verifies source provenance, builds and validates the Manifest V3 extension, runs the existing source-only native subprocess smoke, then checks a dedicated real Google Chrome profile. Browser setup and authentication remain under human control.
+
+## What it checks
+
+- Canonical repository origin, clean main, current origin/main SHA, source-smoke SHA, Node runtime SHA-256, and official Google Chrome version/runtime SHA-256.
+- One private user-controlled profile at ~/.bke-worker/f1/chrome-profile and a candidate Chrome process selected for that exact profile. The owner, symlink state, and group/world permission bits of every dedicated path component (.bke-worker, f1, chrome-profile) are checked on both creation and reuse. It will not attach to or read the default browser profile.
+- Exactly one enabled extension loaded from the canonical browser-extension folder, at the manifest version and with the intentionally narrow storage and chatgpt.com host permissions. Extension ID/path/version are explicitly owner-verified through chrome://extensions; the script never reads Chrome Preferences or other profile metadata.
+- Exact native-host registration name bke.worker.desktop, extension-origin binding and the existing owner-pinned policy verification.
+- The extension ID and an explicit count of matching canonical-source/version extension entries from chrome://extensions; a count other than one fails closed. The operator then attests the source path/version/enabled state. The script does not read Chrome Preferences or other profile metadata.
+- Human visual attestations for profile exclusivity, exactly one open chatgpt.com tab, and a manually authenticated idle ChatGPT UI. It does not read cookies, local storage, page text or login secrets.
+
+When no isolated profile exists, creating and launching one requires the exact in-script owner acknowledgement CREATE_AND_LAUNCH_ISOLATED_CHROME_PROFILE. The operator authenticates manually and loads the unpacked extension from chrome://extensions. If a matching native-host registration is absent, the existing transactional installer is offered only after PREPARE_USER_LEVEL_CHROME_NATIVE_HOST; its own install acknowledgement and a pre-existing valid owner policy are required. It never invents identity pins or overwrites conflicting files.
+
+## macOS signed-process gate (source-only, no new authority)
+
+The Darwin process probe uses the Apple-supported `/usr/bin/codesign` PID
+form to dynamically verify the *running* process against the Google Chrome
+stable identity (`com.google.Chrome`, Google Developer ID team
+`EQHXZ8M8AV`). It obtains the executable path using `libproc.proc_pidpath`
+instead of trusting the `ps` command name, refuses duplicate matching
+candidates, and rechecks running code identity against disk CodeDirectory
+identity and the OS process path. Missing tools, unsupported OS access,
+ambiguous candidates or changed evidence fail closed. CI runs the actual
+Python regression functions and controlled hostile process fixtures, not an
+unconditional PASS print.
+
+**Security limit:** The `--user-data-dir` argument and owner-readiness
+attestations remain observations, NOT an OS-authenticated browser/profile
+association. A signed Chrome PID and matching command line cannot prove
+exclusive control of a particular profile, device session or ChatGPT target;
+PID reuse is not eliminated by this probe alone. The printed SHA-256 remains
+the *on-disk executable* digest for readiness, not a signed peer certificate.
+Do not turn it into `browser_profile_sha256`,
+`profile_binding_sha256`, a policy issuer or a Command Center trust claim.
+The owner-pinned policy and physical Chrome/native-host acceptance remain
+separately blocked until independently trusted provenance is established.
+On actual macOS, OS API availability and the complete Chrome/profile
+observation are NOT certified by Linux CI.
+
+## Result meanings
+
+- SOURCE_SMOKE_PASS is source build/manifest validation and the synthetic Node native-subprocess suite passing on the exact current main SHA.
+- REAL_CHROME_READY is an operator-side readiness checkpoint: the live Chrome executable, dedicated profile/process, extension ID/version/path, native-host registration/policy, one chatgpt.com target, and human authentication/idle attestations met the checks.
+- BLOCKED includes stable reason codes. Do not interpret it as a pass or bypass it.
+
+The manifest requires only `storage` and the `https://chatgpt.com/*` host permission, and permits **only** optional `nativeMessaging` following an explicit owner popup click. The readiness script does **not** request this permission or inspect whether it was granted; the report records `native_messaging_permission: NOT_CHECKED` and `live_chrome_connection: NOT_TESTED`. Native-host registration verification is not a Chrome-launched signed handshake. Pairing/transport, GitHub assignment authority, first-message submission, conversation-ID reconciliation, autonomous wake and enrollment remain absent.
+
+## Privacy and authority
+
+The private local report stores commit SHA, executable SHA-256 hashes, extension ID/version, status codes, and hashes of the selected profile/source paths; it does not serialize raw paths, cookies, page content, prompts, credentials, extension storage or ChatGPT conversation IDs. It records NOT_CREATED_NO_SEND_OCCURRED. The script never sends a message, grants permissions, invokes CDP/Playwright, registers a worker, or deploys cloud resources.
+
+REAL_CHROME_READY is not worker enrollment, authenticated GitHub attempt/fence, send permission, unattended wake, or production/PREPRODUCTION activation. Production remains locked.

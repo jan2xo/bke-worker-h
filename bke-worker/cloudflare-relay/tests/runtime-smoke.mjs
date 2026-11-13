@@ -1,0 +1,557 @@
+import assert from "node:assert/strict";
+import { createHash, createHmac, randomBytes } from "node:crypto";
+import net from "node:net";
+import { deriveRelayToken } from "../src/protocol.js";
+
+const baseUrl = process.env.BKE_RELAY_SMOKE_URL || "http://127.0.0.1:8790";
+const relayTokenKey = process.env.BKE_WORKER_RELAY_TOKEN_KEY || "";
+const webhookSecret = process.env.BKE_WORKER_GITHUB_WEBHOOK_SECRET || "";
+
+assert.ok(relayTokenKey, "BKE_WORKER_RELAY_TOKEN_KEY required");
+assert.ok(webhookSecret, "BKE_WORKER_GITHUB_WEBHOOK_SECRET required");
+
+const url = new URL(baseUrl);
+const host = url.hostname;
+const port = Number(url.port || 80);
+const workerId = "android-worker-a";
+const relayToken = await deriveRelayToken(relayTokenKey, workerId);
+
+function encodeClientText(text) {
+  const payload = Buffer.from(text, "utf8");
+  const mask = randomBytes(4);
+  let header;
+
+  if (payload.length < 126) {
+    header = Buffer.from([0x81, 0x80 | payload.length]);
+  } else if (payload.length <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(payload.length, 2);
+  } else {
+    throw new Error("smoke frame unexpectedly large");
+  }
+
+  const masked = Buffer.alloc(payload.length);
+  for (let index = 0; index < payload.length; index += 1) {
+    masked[index] = payload[index] ^ mask[index % 4];
+  }
+  return Buffer.concat([header, mask, masked]);
+}
+
+function parseServerFrame(buffer) {
+  if (buffer.length < 2) return null;
+  const fin = (buffer[0] & 0x80) !== 0;
+  const opcode = buffer[0] & 0x0f;
+  const masked = (buffer[1] & 0x80) !== 0;
+  let length = buffer[1] & 0x7f;
+  let offset = 2;
+
+  if (!fin) throw new Error("fragmented server frame not supported in smoke");
+  if (masked) throw new Error("server WebSocket frame must not be masked");
+
+  if (length === 126) {
+    if (buffer.length < 4) return null;
+    length = buffer.readUInt16BE(2);
+    offset = 4;
+  } else if (length === 127) {
+    if (buffer.length < 10) return null;
+    const high = buffer.readUInt32BE(2);
+    const low = buffer.readUInt32BE(6);
+    if (high !== 0) throw new Error("server frame too large");
+    length = low;
+    offset = 10;
+  }
+
+  if (buffer.length < offset + length) return null;
+  const payload = buffer.subarray(offset, offset + length);
+  return {
+    opcode,
+    payload,
+    rest: buffer.subarray(offset + length),
+  };
+}
+
+class RawWebSocket {
+  constructor() {
+    this.socket = null;
+    this.buffer = Buffer.alloc(0);
+    this.waiters = [];
+  }
+
+  async connect(pathname) {
+    const key = randomBytes(16).toString("base64");
+    const expectedAccept = createHash("sha1")
+      .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+      .digest("base64");
+
+    await new Promise((resolve, reject) => {
+      const socket = net.createConnection({ host, port });
+      this.socket = socket;
+      let handshake = Buffer.alloc(0);
+
+      const onError = (error) => reject(error);
+      socket.once("error", onError);
+
+      socket.on("connect", () => {
+        socket.write(
+          [
+            `GET ${pathname} HTTP/1.1`,
+            `Host: ${host}:${port}`,
+            "Upgrade: websocket",
+            "Connection: Upgrade",
+            `Sec-WebSocket-Key: ${key}`,
+            "Sec-WebSocket-Version: 13",
+            `Authorization: Bearer ${relayToken}`,
+            "",
+            "",
+          ].join("\r\n"),
+        );
+      });
+
+      const onHandshakeData = (chunk) => {
+        handshake = Buffer.concat([handshake, chunk]);
+        const marker = handshake.indexOf("\r\n\r\n");
+        if (marker < 0) return;
+
+        socket.off("data", onHandshakeData);
+        socket.removeListener("error", onError);
+
+        const head = handshake.subarray(0, marker).toString("utf8");
+        const rest = handshake.subarray(marker + 4);
+        assert.match(head, /^HTTP\/1\.1 101\b/m);
+        assert.ok(
+          head.toLowerCase().includes(
+            `sec-websocket-accept: ${expectedAccept.toLowerCase()}`,
+          ),
+          "WebSocket accept header mismatch",
+        );
+
+        this.buffer = Buffer.concat([this.buffer, rest]);
+        socket.on("data", (data) => this.onData(data));
+        socket.on("error", (error) => this.rejectWaiters(error));
+        socket.on("close", () => this.rejectWaiters(new Error("websocket closed")));
+        resolve();
+      };
+
+      socket.on("data", onHandshakeData);
+    });
+  }
+
+  onData(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    this.drain();
+  }
+
+  rejectWaiters(error) {
+    for (const waiter of this.waiters.splice(0)) {
+      waiter.reject(error);
+    }
+  }
+
+  drain() {
+    while (this.waiters.length > 0) {
+      const frame = parseServerFrame(this.buffer);
+      if (!frame) return;
+      this.buffer = frame.rest;
+
+      if (frame.opcode === 0x8) {
+        this.rejectWaiters(new Error("server closed websocket"));
+        return;
+      }
+      if (frame.opcode === 0x9) {
+        continue;
+      }
+      if (frame.opcode !== 0x1) {
+        continue;
+      }
+
+      const waiter = this.waiters.shift();
+      waiter.resolve(frame.payload.toString("utf8"));
+    }
+  }
+
+  sendText(text) {
+    this.socket.write(encodeClientText(text));
+  }
+
+  nextText(timeoutMs = 5000) {
+    const existing = parseServerFrame(this.buffer);
+    if (existing?.opcode === 0x1) {
+      this.buffer = existing.rest;
+      return Promise.resolve(existing.payload.toString("utf8"));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const index = this.waiters.findIndex((item) => item.resolve === wrappedResolve);
+        if (index >= 0) this.waiters.splice(index, 1);
+        reject(new Error("timed out waiting for WebSocket text frame"));
+      }, timeoutMs);
+
+      const wrappedResolve = (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const wrappedReject = (error) => {
+        clearTimeout(timer);
+        reject(error);
+      };
+      this.waiters.push({ resolve: wrappedResolve, reject: wrappedReject });
+      this.drain();
+    });
+  }
+
+  close() {
+    this.socket?.destroy();
+  }
+}
+
+async function postWebhook({
+  deliveryId,
+  action,
+  sha,
+  number = 13,
+  prBody = "",
+  priorBody = null,
+  addedLabel = null,
+  sender = "external-user",
+  headRepoOwner = "jan2xo",
+}) {
+  const body = JSON.stringify({
+    action,
+    number,
+    sender: { login: sender },
+    repository: { full_name: "jan2xo/bke-worker" },
+    pull_request: {
+      number,
+      state: "open",
+      body: prBody,
+      labels: [{ name: `bke-worker:${workerId}` }],
+      head: {
+        ref: "test/utm-wss-relay-smoke",
+        sha,
+        repo: {
+          full_name: "jan2xo/bke-worker",
+          owner: { login: headRepoOwner },
+        },
+      },
+    },
+    ...(action === "labeled"
+      ? { label: { name: addedLabel || `bke-worker:${workerId}` } }
+      : {}),
+    ...(action === "edited" && priorBody !== null
+      ? { changes: { body: { from: priorBody } } }
+      : {}),
+  });
+  const signature = createHmac("sha256", webhookSecret).update(body).digest("hex");
+
+  const response = await fetch(new URL("/webhooks/github", baseUrl), {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-GitHub-Event": "pull_request",
+      "X-GitHub-Delivery": deliveryId,
+      "X-Hub-Signature-256": `sha256=${signature}`,
+    },
+    body,
+  });
+
+  return {
+    status: response.status,
+    body: await response.json(),
+  };
+}
+
+const ws = new RawWebSocket();
+try {
+  await ws.connect(`/relay/${workerId}`);
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "register",
+    worker_id: workerId,
+    session_id: "cloudflare-local-smoke",
+  }));
+
+  const first = await postWebhook({
+    deliveryId: "cloudflare-smoke-001",
+    action: "opened",
+    sha: "0123456789abcdef0123456789abcdef01234567",
+  });
+  assert.equal(first.status, 202);
+  assert.equal(first.body.accepted, true);
+
+  const wake = JSON.parse(await ws.nextText());
+  assert.deepEqual(Object.keys(wake).sort(), [
+    "delivery_id",
+    "expected_head_sha",
+    "pr_number",
+    "protocol",
+    "reason",
+    "repo",
+    "type",
+    "worker_id",
+  ].sort());
+  assert.equal(wake.worker_id, workerId);
+  assert.equal(wake.delivery_id, "cloudflare-smoke-001");
+  assert.equal(wake.expected_head_sha, "0123456789abcdef0123456789abcdef01234567");
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake.delivery_id,
+    state: "accepted",
+  }));
+
+  // A same-repo synchronize authored by the head repository owner is the worker's
+  // own active execution advancement and must not create another visible turn.
+  const selfSynchronize = await postWebhook({
+    deliveryId: "cloudflare-smoke-self-001",
+    action: "synchronize",
+    sha: "9999999999999999999999999999999999999999",
+    sender: "jan2xo",
+    headRepoOwner: "jan2xo",
+  });
+  assert.equal(selfSynchronize.status, 202);
+  assert.equal(
+    selfSynchronize.body.relay.state,
+    "self_synchronize_suppressed",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  // A newer exact head for the same PR supersedes an ambiguous active wake.
+  const superseding = await postWebhook({
+    deliveryId: "cloudflare-smoke-002",
+    action: "synchronize",
+    sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    sender: "external-user",
+    headRepoOwner: "jan2xo",
+  });
+  assert.equal(superseding.status, 202);
+  assert.equal(superseding.body.relay.state, "superseded_sent");
+  assert.equal(
+    superseding.body.relay.superseded_delivery_id,
+    "cloudflare-smoke-001",
+  );
+
+  const wake2 = JSON.parse(await ws.nextText());
+  assert.equal(wake2.delivery_id, "cloudflare-smoke-002");
+  assert.equal(wake2.expected_head_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+  // A late ACK from the superseded delivery must not kill the authoritative socket.
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake.delivery_id,
+    state: "completed",
+  }));
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake2.delivery_id,
+    state: "accepted",
+  }));
+
+  // Same-head re-evaluation is still serialized behind the active delivery.
+  const sameHead = await postWebhook({
+    deliveryId: "cloudflare-smoke-003",
+    action: "synchronize",
+    sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  });
+  assert.equal(sameHead.status, 202);
+  assert.equal(sameHead.body.relay.state, "queued_behind_active");
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake2.delivery_id,
+    state: "completed",
+  }));
+
+  const wake3 = JSON.parse(await ws.nextText());
+  assert.equal(wake3.delivery_id, "cloudflare-smoke-003");
+  assert.equal(wake3.expected_head_sha, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake3.delivery_id,
+    state: "completed",
+  }));
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const duplicate = await postWebhook({
+    deliveryId: "cloudflare-smoke-001",
+    action: "opened",
+    sha: "0123456789abcdef0123456789abcdef01234567",
+  });
+  assert.equal(duplicate.status, 200);
+  assert.equal(duplicate.body.relay.state, "duplicate");
+
+  const rejected = await postWebhook({
+    deliveryId: "cloudflare-smoke-004",
+    action: "synchronize",
+    sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  });
+  assert.equal(rejected.status, 202);
+
+  const wake4 = JSON.parse(await ws.nextText());
+  assert.equal(wake4.delivery_id, "cloudflare-smoke-004");
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake4.delivery_id,
+    state: "rejected",
+  }));
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const afterReject = await postWebhook({
+    deliveryId: "cloudflare-smoke-005",
+    action: "synchronize",
+    sha: "cccccccccccccccccccccccccccccccccccccccc",
+  });
+  assert.equal(afterReject.status, 202);
+  assert.notEqual(afterReject.body.relay.state, "queued_behind_active");
+
+  const wake5 = JSON.parse(await ws.nextText());
+  assert.equal(wake5.delivery_id, "cloudflare-smoke-005");
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake5.delivery_id,
+    state: "completed",
+  }));
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  // Re-applying the worker assignment label is an explicit same-head recovery signal.
+  const ambiguous = await postWebhook({
+    deliveryId: "cloudflare-smoke-006",
+    action: "opened",
+    sha: "dddddddddddddddddddddddddddddddddddddddd",
+  });
+  assert.equal(ambiguous.status, 202);
+
+  const wake6 = JSON.parse(await ws.nextText());
+  assert.equal(wake6.delivery_id, "cloudflare-smoke-006");
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake6.delivery_id,
+    state: "accepted",
+  }));
+
+  const recovered = await postWebhook({
+    deliveryId: "cloudflare-smoke-007",
+    action: "labeled",
+    sha: "dddddddddddddddddddddddddddddddddddddddd",
+  });
+  assert.equal(recovered.status, 202);
+  assert.equal(recovered.body.relay.state, "recovered_sent");
+  assert.equal(
+    recovered.body.relay.superseded_delivery_id,
+    "cloudflare-smoke-006",
+  );
+
+  const wake7 = JSON.parse(await ws.nextText());
+  assert.equal(wake7.delivery_id, "cloudflare-smoke-007");
+  assert.equal(wake7.expected_head_sha, "dddddddddddddddddddddddddddddddddddddddd");
+
+  // The late ACK from the explicitly recovered delivery is harmless.
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake6.delivery_id,
+    state: "completed",
+  }));
+
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake7.delivery_id,
+    state: "completed",
+  }));
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  // A different PR remains fail-closed until an exact GitHub recovery marker is edited in.
+  const staleDifferentPr = await postWebhook({
+    deliveryId: "cloudflare-smoke-008",
+    action: "opened",
+    sha: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    number: 12,
+  });
+  assert.equal(staleDifferentPr.status, 202);
+  const wake8 = JSON.parse(await ws.nextText());
+  assert.equal(wake8.pr_number, 12);
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake8.delivery_id,
+    state: "accepted",
+  }));
+
+  const blockedCrossPr = await postWebhook({
+    deliveryId: "cloudflare-smoke-009",
+    action: "opened",
+    sha: "ffffffffffffffffffffffffffffffffffffffff",
+    number: 13,
+  });
+  assert.equal(blockedCrossPr.status, 409);
+  assert.equal(blockedCrossPr.body.relay.error, "WORKER_WAKE_IN_FLIGHT");
+
+  const recoveryHead = "ffffffffffffffffffffffffffffffffffffffff";
+  const recoveryMarker = `<!-- BKE-RECOVER-CROSS-PR-WAKE worker=${workerId} pr=13 head=${recoveryHead} -->`;
+  const recoveredCrossPr = await postWebhook({
+    deliveryId: "cloudflare-smoke-010",
+    action: "edited",
+    sha: recoveryHead,
+    number: 13,
+    prBody: `Task intent\n\n${recoveryMarker}`,
+    priorBody: "Task intent",
+  });
+  assert.equal(recoveredCrossPr.status, 202);
+  assert.equal(recoveredCrossPr.body.relay.state, "cross_pr_recovered_sent");
+  assert.equal(recoveredCrossPr.body.relay.superseded_pr, 12);
+
+  const wake10 = JSON.parse(await ws.nextText());
+  assert.equal(wake10.pr_number, 13);
+  assert.equal(wake10.reason, "github_pull_request_cross_pr_recovery");
+
+  // A late ACK from the retired cross-PR wake must not disturb the new authoritative wake.
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake8.delivery_id,
+    state: "completed",
+  }));
+  ws.sendText(JSON.stringify({
+    protocol: 1,
+    type: "ack",
+    worker_id: workerId,
+    delivery_id: wake10.delivery_id,
+    state: "completed",
+  }));
+
+  console.log("BKE Worker Cloudflare local runtime smoke: PASS");
+} finally {
+  ws.close();
+}

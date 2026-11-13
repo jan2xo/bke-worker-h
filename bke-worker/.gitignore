@@ -1,0 +1,28 @@
+bin/
+obj/
+artifacts/
+.vs/
+.idea/
+.DS_Store
+
+# Local BKE Worker runtime material. Treat browser profiles as credentials.
+.bke-worker/
+chatgpt-profile/
+worker-state/
+*.worker-state.json
+
+# Browser extension build/dependency output.
+browser-extension/dist/
+browser-extension/native-host/claim/dist/
+browser-extension/node_modules/
+
+# UTM WSS smoke relay development TLS/private material.
+.bke-worker-utm-relay/
+
+# Cloudflare relay local material.
+cloudflare-relay/.wrangler/
+cloudflare-relay/node_modules/
+cloudflare-relay/.dev.vars*
+cloudflare-relay/.env*
+
+cloudflare-relay/.wrangler-bootstrap.*.toml

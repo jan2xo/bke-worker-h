@@ -1,0 +1,375 @@
+name: PR Guard
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Intent + CI policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify BKE PR and intentional-CI policy
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          root = Path(".")
+          workflows = root / ".github/workflows"
+          active = sorted(path.name for path in workflows.glob("*.yml"))
+          expected = ["certify.yml", "pr-guard.yml", "serial-dispatcher.yml"]
+          if active != expected:
+              raise SystemExit(
+                  f"Active workflows drifted: expected {expected}, got {active}"
+              )
+
+          certify = (workflows / "certify.yml").read_text(encoding="utf-8")
+          if "\n  workflow_dispatch:" not in certify or "\n  issue_comment:" not in certify:
+              raise SystemExit("Intent certification is not explicitly invokable.")
+
+          for token in [
+              'new Set(["core", "server", "chatgpt", "android", "android-recovery", "android-recovery-github", "android-preproduction", "android-release", "relay"])',
+              "name: Android Gecko Worker probe",
+              "python3 tests/android_gecko_probe_contract.py",
+              "python3 tests/utm_relay_contract.py",
+              "gradle -p android-gecko :app:assembleDebug --stacktrace",
+              "bke-worker-android-gecko-probe",
+              "name: Android recovery local contract",
+              "name: Android recovery GitHub signed APK build",
+              "python3 tests/android_recovery_signing_contract.py",
+              "python3 tests/android_recovery_operator_contract.py",
+              ":app:assembleRecovery",
+              "bke-worker-android-recovery-sidecar",
+              "ANDROID_REQUIRED:",
+              "ANDROID_RESULT:",
+              "ANDROID_RECOVERY_REQUIRED:",
+              "ANDROID_RECOVERY_RESULT:",
+              "ANDROID_RECOVERY_GITHUB_REQUIRED:",
+              "ANDROID_RECOVERY_GITHUB_RESULT:",
+              "name: Android PREPRODUCTION signed build",
+              "BKE_ANDROID_PREPRODUCTION_KEYSTORE_B64",
+              "BKE_ANDROID_PREPRODUCTION_CERT_SHA256",
+              ":app:assemblePreproduction",
+              "bke-worker-android-preproduction-candidate",
+              "ANDROID_PREPRODUCTION_REQUIRED:",
+              "ANDROID_PREPRODUCTION_RESULT:",
+              "Publish Android PREPRODUCTION prerelease",
+              "name: Android production release",
+              "BKE_ANDROID_SIGNING_KEYSTORE_B64",
+              "BKE_ANDROID_SIGNING_CERT_SHA256",
+              ":app:assembleRelease",
+              "bke-worker-android-production-candidate",
+              "ANDROID_RELEASE_REQUIRED:",
+              "ANDROID_RELEASE_RESULT:",
+              "name: Cloudflare durable relay",
+              "python3 tests/cloudflare_relay_contract.py",
+              "npm run check",
+              "npm run runtime-smoke",
+              "RELAY_REQUIRED:",
+              "RELAY_RESULT:",
+          ]:
+              if token not in certify:
+                  raise SystemExit(f"Android certification module lost: {token}")
+
+          dispatcher = (workflows / "serial-dispatcher.yml").read_text(encoding="utf-8")
+          for token in [
+              "issues:",
+              "pull_request_target:",
+              "workflow_dispatch:",
+              "group: bke-worker-serial-dispatcher",
+              "cancel-in-progress: false",
+              "contents: read",
+              "id-token: write",
+              "github.event.repository.default_branch",
+              "BKE_WORKER_GITHUB_APP_BROKER_URL",
+              "bke-worker-github-app-broker",
+              "/github/app/install-token",
+              'export GITHUB_TOKEN="$BKE_GITHUB_APP_TOKEN"',
+              "persist-credentials: false",
+              "python3 scripts/github_serial_dispatcher.py",
+              "BKE_WORKER_ID: android-worker-a",
+          ]:
+              if token not in dispatcher:
+                  raise SystemExit(
+                      "Serial dispatcher workflow lost required boundary: " + token
+                  )
+
+          for forbidden in [
+              "contents: write",
+              "pull-requests: write",
+              "issues: write",
+              "GITHUB_TOKEN: ${{ github.token }}",
+              "worker-b",
+              "worker-c",
+              "github.event.pull_request.head.sha",
+          ]:
+              if forbidden in dispatcher:
+                  raise SystemExit(
+                      "Serial dispatcher gained forbidden parallel/untrusted-head behavior: "
+                      + forbidden
+                  )
+
+          automatic = re.findall(
+              r"(?m)^  (push|pull_request|schedule|workflow_run):",
+              certify,
+          )
+          if automatic:
+              raise SystemExit(
+                  "Substantial certification gained automatic triggers: "
+                  + ", ".join(automatic)
+              )
+
+          canonical = (
+              root / "BKE-WORKER-CANONICAL-PROJECT-EXECUTION-INSTRUCTIONS.md"
+          ).read_text(encoding="utf-8")
+          for token in [
+              "AUTONOMOUS GATEKEEPER AND INTENT-DRIVEN EXECUTION",
+              "necessary independent dependency",
+              "owner-blocked",
+              "Blocked lane != blocked mission",
+              "docs/autonomous-gatekeeper.md",
+              "Operator action entrypoints",
+              "one repo-tracked operator entrypoint script",
+              "prompt **inside the script, at the point of need**",
+              "without automating credentials",
+              "docs/operator-entrypoints.md",
+              "MVP SCOPE GATE (LEASH)",
+              "MVP-Task: #",
+          ]:
+              if token not in canonical:
+                  raise SystemExit(
+                      "Autonomous gatekeeper contract lost required rule: " + token
+                  )
+
+          gatekeeper = (
+              root / "docs/autonomous-gatekeeper.md"
+          ).read_text(encoding="utf-8")
+          for token in [
+              "Durable IF / ELSE decision engine",
+              "Necessary independent dependency",
+              "Invented or speculative work",
+              "Owner-blocked lane behavior",
+              "Notion mirror policy",
+          ]:
+              if token not in gatekeeper:
+                  raise SystemExit(
+                      "Autonomous gatekeeper documentation lost: " + token
+                  )
+
+          template = (
+              root / ".github/pull_request_template.md"
+          ).read_text(encoding="utf-8")
+          required = [
+              "## Description",
+              "## How Has This Been Tested?",
+              "## Architecture / Security",
+              "## Operator Action",
+              "Human-only inputs",
+              "bash scripts/<intent-entrypoint>.sh",
+              "## Checklist",
+              "## Certification Notes",
+              "One independent engineering intent belongs in one PR",
+              "fresh branch",
+              "next independent wave",
+              "PR comments = durable BKE execution ledger",
+              "MVP-Task: #",
+          ]
+          missing = [token for token in required if token not in template]
+          if missing:
+              raise SystemExit(
+                  "BKE PR template lost required autonomous-engineering rules: "
+                  + ", ".join(missing)
+              )
+
+          print("BKE Worker PR Guard: PASS")
+
+      - name: Execute serial Master Queue dispatcher contract
+        run: |
+          python3 tests/serial_dispatcher_contract.py
+          python3 tests/multiworker_ownership_contract.py
+          python3 tests/github_complete_worker_inventory_contract.py
+          python3 tests/multiworker_preclaim_contract.py
+          python3 tests/github_atomic_claim_contract.py
+
+      - name: Execute Android PREPRODUCTION signing contract
+        run: python3 tests/android_preproduction_signing_contract.py
+
+      - name: Execute operator entrypoint contract
+        run: |
+          python3 tests/operator_entrypoint_contract.py
+          python3 tests/chrome_native_host_installer_contract.py
+          python3 tests/forge_f1_desktop_readiness_contract.py
+          python3 tests/forge_f1_chrome_readiness_test.py
+          bash tests/chrome_native_host_installer_contract.sh
+          bash -n scripts/prepare-chrome-native-host.sh
+          python3 tests/android_continuation_operator_contract.py
+          python3 tests/admin_preproduction_operator_contract.py
+          node --test tests/admin_preproduction_activation.test.mjs
+          bash -n scripts/activate-admin-preproduction.sh
+          bash -n scripts/complete-github-app-actuator-preproduction.sh
+          bash -n scripts/certify-android-continuation-preproduction.sh
+
+
+  bke-intent:
+    name: BKE pinned intent consumer proof
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Resolve and execute pinned BKE intent
+        id: bke
+        uses: jan2xo/bke-autonomous-engineering/.github/actions/intent-ci@b42648da2a14fdc29e5db1213f28f5cedcf61889
+        with:
+          head-sha: ${{ github.event.pull_request.head.sha }}
+          run-id: ${{ github.run_id }}
+
+  webextension-device-identity:
+    name: Exact-head WebExtension identity contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Identify actual browser-extension changes
+        id: paths
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner,repo}=context.repo;
+            const files=await github.paginate(github.rest.pulls.listFiles,{
+              owner,repo,pull_number:context.issue.number,per_page:100
+            });
+            const changed=files.some(file=>file.filename.startsWith("browser-extension/") || file.filename==="scripts/prepare-chrome-native-host.sh" || file.filename==="tests/chrome_native_host_installer_contract.py");
+            core.setOutput("run",changed?"true":"false");
+
+      - name: Checkout exact untrusted PR head for isolated testing
+        if: steps.paths.outputs.run == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up Node 22
+        if: steps.paths.outputs.run == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pinned browser-extension compiler
+        if: steps.paths.outputs.run == 'true'
+        working-directory: browser-extension
+        run: npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+
+      - name: Build, manifest audit and adversarial P-256 tests
+        if: steps.paths.outputs.run == 'true'
+        working-directory: browser-extension
+        run: npm run check
+
+      - name: Run report-producing desktop/native integration smoke
+        if: steps.paths.outputs.run == 'true'
+        working-directory: browser-extension
+        run: npm run smoke:native -- --report "$RUNNER_TEMP/desktop-native-smoke-report.json"
+
+      - name: Upload desktop/native smoke evidence
+        if: steps.paths.outputs.run == 'true' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-native-smoke-report-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/desktop-native-smoke-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Check owner smoke entrypoint syntax
+        if: steps.paths.outputs.run == 'true'
+        run: bash -n scripts/smoke-desktop-native-integration.sh
+
+      - name: Diff hygiene
+        if: steps.paths.outputs.run == 'true'
+        run: git diff --check
+
+  mvp-scope-gate:
+    name: MVP scope gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - name: Enforce MVP scope (issue #149)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Leash: every PR must serve one open `bke:mvp` issue, stay small,
+            // and stay out of frozen surfaces unless that issue names them.
+            const {owner, repo} = context.repo;
+            // Read the PR live, so re-runs see current body and labels (re-runs reuse the old event payload).
+            const pr = (await github.rest.pulls.get({owner, repo, pull_number: context.payload.pull_request.number})).data;
+            const fail = [];
+            const prLabels = (pr.labels || []).map(l => l.name);
+            const body = pr.body || "";
+            const m = body.match(/^\s*MVP-Task:\s*#(\d+)\s*$/m);
+            if (!m) {
+              core.setFailed("MVP scope gate: PR body needs a line `MVP-Task: #<issue>` naming an open `bke:mvp` issue (see #149).");
+              return;
+            }
+            const taskNo = Number(m[1]);
+            let task;
+            try {
+              task = (await github.rest.issues.get({owner, repo, issue_number: taskNo})).data;
+            } catch (e) {
+              core.setFailed(`MVP scope gate: issue #${taskNo} not found.`);
+              return;
+            }
+            const taskLabels = task.labels.map(l => typeof l === "string" ? l : l.name);
+            if (task.pull_request) fail.push(`#${taskNo} is a PR, not an issue.`);
+            if (task.state !== "open") fail.push(`#${taskNo} is not open.`);
+            if (!taskLabels.includes("bke:mvp")) fail.push(`#${taskNo} is not labeled bke:mvp.`);
+            const taskText = (task.body || "") + "\n" + task.title;
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: pr.number, per_page: 100,
+            });
+            const MAX = 500;
+            const changed = files.reduce((n, f) => n + f.additions + f.deletions, 0);
+            if (changed > MAX && !prLabels.includes("bke:oversize-ok")) {
+              fail.push(`${changed} changed lines > ${MAX}. Split the PR, or the owner adds label bke:oversize-ok.`);
+            }
+
+            // Frozen surfaces: allowed only when the task issue names the path prefix.
+            const frozen = [
+              "cloudflare-relay/", "android-gecko/", "src/", "deploy/",
+              "BKE.Worker.sln", "Directory.Build.props",
+            ];
+            for (const f of files) {
+              const hit = frozen.find(p => f.filename.startsWith(p));
+              if (hit && !taskText.includes(hit)) {
+                fail.push(`${f.filename}: frozen surface ${hit} not listed in #${taskNo}.`);
+              }
+            }
+
+            // The gate itself and CI: owner-only change.
+            if (files.some(f => f.filename.startsWith(".github/")) && !prLabels.includes("bke:gate-change")) {
+              fail.push("Touches .github/ (CI or this gate). Owner must add label bke:gate-change.");
+            }
+
+            // No new markdown ledgers unless the task names the exact file.
+            for (const f of files) {
+              if (f.status === "added" && f.filename.toLowerCase().endsWith(".md") && !taskText.includes(f.filename)) {
+                fail.push(`New doc ${f.filename} is not named in #${taskNo}.`);
+              }
+            }
+
+            if (fail.length) {
+              core.setFailed("MVP scope gate FAILED:\n- " + fail.join("\n- "));
+            } else {
+              core.info(`MVP scope gate PASS: serves #${taskNo}, ${changed} changed lines, ${files.length} files.`);
+            }
