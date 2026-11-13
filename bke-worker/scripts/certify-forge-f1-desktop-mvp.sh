@@ -34,6 +34,7 @@ HMAC/journal crash-recovery, and synthetic 2-turn zero-duplicate acceptance gate
 
 Options:
   --dry-run   Run all deterministic local acceptance checks without launching Chrome.
+  --sandbox   Allow nested sandbox repository jan2xo/bke-worker-h explicitly.
   --help      Show this help message and exit.
 
 Human-only boundary:
@@ -43,6 +44,7 @@ EOF
 }
 
 DRY_RUN=0
+SANDBOX_MODE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h)
@@ -53,6 +55,10 @@ while [[ $# -gt 0 ]]; do
       DRY_RUN=1
       shift
       ;;
+    --sandbox)
+      SANDBOX_MODE=1
+      shift
+      ;;
     *)
       fail "UNKNOWN_ARGUMENT"
       ;;
@@ -61,18 +67,33 @@ done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || fail "ENTRYPOINT_PATH_UNSAFE"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "$0")"
-ROOT_DIR="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null)" || fail "NOT_IN_GIT_REPOSITORY"
-ROOT_DIR="$(cd -- "$ROOT_DIR" && pwd -P)" || fail "REPOSITORY_PATH_UNSAFE"
+if [[ "$SANDBOX_MODE" -eq 1 ]]; then
+  ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd -P)" || fail "REPOSITORY_PATH_UNSAFE"
+  GIT_ROOT="$(git -C "$ROOT_DIR" rev-parse --show-toplevel 2>/dev/null)" || fail "NOT_IN_GIT_REPOSITORY"
+  ORIGIN_URL="$(git -C "$GIT_ROOT" remote get-url origin 2>/dev/null || true)"
+  if [[ -z "$ORIGIN_URL" ]]; then
+    ORIGIN_URL="$(git -C "$ROOT_DIR/.." remote get-url origin 2>/dev/null || true)"
+  fi
+  [[ -n "$ORIGIN_URL" ]] || fail "ORIGIN_REMOTE_MISSING"
+  case "$ORIGIN_URL" in
+    "https://github.com/$REPOSITORY_CANONICAL"|"https://github.com/$REPOSITORY_CANONICAL.git"|"git@github.com:$REPOSITORY_CANONICAL.git"|"ssh://git@github.com/$REPOSITORY_CANONICAL.git"|\
+    "https://github.com/jan2xo/bke-worker-h"|"https://github.com/jan2xo/bke-worker-h.git"|"git@github.com:jan2xo/bke-worker-h.git"|"ssh://git@github.com/jan2xo/bke-worker-h.git") ;;
+    *) fail "ORIGIN_REPOSITORY_UNTRUSTED" ;;
+  esac
+else
+  ROOT_DIR="$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel 2>/dev/null)" || fail "NOT_IN_GIT_REPOSITORY"
+  ROOT_DIR="$(cd -- "$ROOT_DIR" && pwd -P)" || fail "REPOSITORY_PATH_UNSAFE"
+  ORIGIN_URL="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null)" || fail "ORIGIN_REMOTE_MISSING"
+  case "$ORIGIN_URL" in
+    "https://github.com/$REPOSITORY_CANONICAL"|"https://github.com/$REPOSITORY_CANONICAL.git"|"git@github.com:$REPOSITORY_CANONICAL.git"|"ssh://git@github.com/$REPOSITORY_CANONICAL.git") ;;
+    *) fail "ORIGIN_REPOSITORY_UNTRUSTED" ;;
+  esac
+fi
 [[ ! -L "$SCRIPT_PATH" && "$SCRIPT_PATH" == "$ROOT_DIR/scripts/certify-forge-f1-desktop-mvp.sh" ]] || fail "ENTRYPOINT_PATH_UNSAFE"
 
 if [[ "$DRY_RUN" -eq 0 && "$(id -u)" == "0" ]]; then
   fail "DO_NOT_RUN_AS_ROOT"
 fi
-ORIGIN_URL="$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null)" || fail "ORIGIN_REMOTE_MISSING"
-case "$ORIGIN_URL" in
-  "https://github.com/$REPOSITORY_CANONICAL"|"https://github.com/$REPOSITORY_CANONICAL.git"|"git@github.com:$REPOSITORY_CANONICAL.git"|"ssh://git@github.com/$REPOSITORY_CANONICAL.git") ;;
-  *) fail "ORIGIN_REPOSITORY_UNTRUSTED" ;;
-esac
 
 for tool in git node npm python3; do
   command -v "$tool" >/dev/null 2>&1 || fail "REQUIRED_TOOL_MISSING_${tool^^}"

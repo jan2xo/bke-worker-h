@@ -22,6 +22,7 @@ const initializeIdentityButton = document.querySelector<HTMLButtonElement>("#ini
 const feedback = document.querySelector<HTMLElement>("#feedback")!;
 const policyFile = document.querySelector<HTMLInputElement>("#native-policy-file")!;
 const verifyNativeButton = document.querySelector<HTMLButtonElement>("#verify-native-local")!;
+const connectControllerButton = document.querySelector<HTMLButtonElement>("#connect-controller")!;
 let localOwnerPolicy: unknown = null;
 
 policyFile.addEventListener("change", async () => {
@@ -78,6 +79,37 @@ verifyNativeButton.addEventListener("click", () => {
     });
 });
 
+connectControllerButton.addEventListener("click", () => {
+  if (localOwnerPolicy === null) {
+    feedback.textContent = "Select the owner-reviewed local policy first.";
+    return;
+  }
+  connectControllerButton.disabled = true;
+  feedback.textContent = "Requesting optional local nativeMessaging permission for controller bridge…";
+  void chrome.permissions.request({ permissions: ["nativeMessaging"] })
+    .then(async (granted: boolean) => {
+      if (granted !== true) {
+        feedback.textContent = "Native permission declined. Controller bridge not connected.";
+        return;
+      }
+      const result = await chrome.runtime.sendMessage({
+        type: "bke.controller.bridge.connect",
+        policy: localOwnerPolicy,
+      });
+      feedback.textContent =
+        result?.state === "BRIDGE_ESTABLISHED"
+          ? "Controller bridge established. Live send remains gated by GitHub assignment and owner authorization."
+          : (result?.code ?? "Controller bridge connection blocked.");
+      await refresh();
+    })
+    .catch(() => {
+      feedback.textContent = "Controller bridge connection unavailable.";
+    })
+    .finally(() => {
+      connectControllerButton.disabled = false;
+    });
+});
+
 const statusEl = document.querySelector<HTMLElement>("#status")!;
 
 function appendStatusLine(label: string, value: string): void {
@@ -121,6 +153,12 @@ async function refresh(): Promise<void> {
     appendStatusLine("Key SHA-256", identity.public_key_sha256);
   }
   appendStatusLine("Bridge", current.connectionState);
+  try {
+    const bridgeStatus = await chrome.runtime.sendMessage({ type: "bke.controller.bridge.status" });
+    appendStatusLine("Controller session", bridgeStatus?.state ?? "DISCONNECTED");
+  } catch {
+    appendStatusLine("Controller session", "UNKNOWN");
+  }
   appendStatusLine("ChatGPT", chatState);
   appendStatusLine("Visible", chat ? String(chat.visible) : "—");
   appendStatusLine(

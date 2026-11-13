@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "BKE Worker Patch Export",
+  "description": "Downloadable unified git patch export for BKE Worker FORGE F1 Desktop MVP completion.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

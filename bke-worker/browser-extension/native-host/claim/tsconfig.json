@@ -9,7 +9,9 @@
     ],
     "rootDir": "../..",
     "outDir": "dist",
+    "types": ["node"],
     "strict": true,
+    "noImplicitOverride": true,
     "noUncheckedIndexedAccess": true,
     "noEmitOnError": true,
     "skipLibCheck": true
@@ -17,6 +19,10 @@
   "include": [
     "send-once-claim-adapter.ts",
     "github-f1-ledger.ts",
-    "desktop-controller.ts"
+    "desktop-controller.ts",
+    "ipc-client.ts",
+    "controller-daemon.ts",
+    "github-app-harness.ts",
+    "command-center-observer.ts"
   ]
 }

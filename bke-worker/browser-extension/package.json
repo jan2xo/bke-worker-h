@@ -7,6 +7,7 @@
     "node": ">=22"
   },
   "devDependencies": {
+    "@types/node": "22.20.5",
     "typescript": "5.8.3"
   },
   "scripts": {
@@ -16,6 +17,9 @@
     "check": "npm run build && npm run validate && npm test && npm run test:native && npm run test:host-claim",
     "test:native": "node --test native-host/tests/*.test.mjs",
     "smoke:native": "npm run build && node scripts/run-desktop-native-smoke.mjs",
+    "controller:build": "tsc -p native-host/claim/tsconfig.json",
+    "controller:cli": "node native-host/claim/dist/native-host/claim/controller-daemon.js",
+    "controller:doctor": "npm run controller:build && node native-host/claim/dist/native-host/claim/controller-daemon.js doctor",
     "test:host-claim": "tsc -p native-host/claim/tsconfig.json && node --test native-host/claim/tests/*.test.mjs"
   }
 }

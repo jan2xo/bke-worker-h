@@ -113,24 +113,54 @@ export class FileExecutionJournal {
   }
 
   async openAndRecover(): Promise<ExecutionJournalState> {
-    let raw: string | null = null;
+    let raw: string;
+    let handle;
     try {
-      raw = await readFile(this.filePath, 'utf8');
+      handle = await open(this.filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
         const fresh = this.initial();
         await this.atomicWrite(fresh);
         return structuredClone(fresh);
       }
+      if ((err as NodeJS.ErrnoException)?.code === 'ELOOP') {
+        throw Error('JOURNAL_SYMLINK_FORBIDDEN');
+      }
       throw err;
     }
 
-    const parsed = JSON.parse(raw) as ExecutionJournalState;
+    try {
+      const info = await handle.stat();
+      if (!info.isFile()) {
+        throw Error('JOURNAL_NOT_REGULAR_FILE');
+      }
+      if ((info.mode & 0o077) !== 0) {
+        throw Error('JOURNAL_PERMISSIONS_INSECURE');
+      }
+      if (typeof process.getuid === 'function' && info.uid !== process.getuid()) {
+        throw Error('JOURNAL_OWNER_INVALID');
+      }
+      raw = await handle.readFile({ encoding: 'utf8' });
+    } finally {
+      await handle.close();
+    }
+
+    let parsed: ExecutionJournalState;
+    try {
+      parsed = JSON.parse(raw) as ExecutionJournalState;
+    } catch {
+      throw Error('JOURNAL_CORRUPT');
+    }
     if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      Array.isArray(parsed) ||
       parsed.version !== 1 ||
       parsed.repository !== this.identity.repository ||
       parsed.prNumber !== this.identity.prNumber ||
-      parsed.workerId !== this.identity.workerId
+      parsed.workerId !== this.identity.workerId ||
+      !Array.isArray(parsed.processedAttempts) ||
+      !Array.isArray(parsed.processedDeliveries)
     ) {
       throw Error('JOURNAL_IDENTITY_MISMATCH');
     }

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "allowed_origin": "chrome-extension://REPLACE_WITH_32_CHAR_EXTENSION_ID_A_TO_P/",
+  "worker_id": "worker-f1",
+  "public_key_sha256": "REPLACE_WITH_64_HEX_P256_THUMBPRINT_SHA256",
+  "profile_binding_sha256": "REPLACE_WITH_64_HEX_OWNER_PROFILE_BINDING_SHA256",
+  "resources": {
+    "bridge_identity_sha256": "REPLACE_WITH_64_HEX_BRIDGE_IDENTITY_SHA256",
+    "browser_profile_sha256": "REPLACE_WITH_64_HEX_BROWSER_PROFILE_SHA256",
+    "chatgpt_target_sha256": "REPLACE_WITH_64_HEX_CHATGPT_TARGET_SHA256"
+  },
+  "expires_at_ms": 0
+}

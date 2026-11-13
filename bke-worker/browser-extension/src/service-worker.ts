@@ -34,9 +34,39 @@ const CONTENT_DISPATCH_MESSAGE = "bke.chatgpt.dispatch";
 const targetBinding=createChatGptTargetBinding(
   ()=>chrome.tabs.query({url:["https://chatgpt.com/*"]}),chrome.runtime.id,
   (tabId:number)=>chrome.webNavigation.getFrame({tabId,frameId:0}));
+const CONSUMED_ATTEMPTS_KEY = "consumedBridgeAttempts";
 let nativeProofActive = false;
 let controllerSupervisor: ControllerBridgeSupervisor | null = null;
 const consumedBridgeAttempts = new Set<string>();
+let attemptsHydrated = false;
+
+async function hydrateConsumedAttempts(): Promise<void> {
+  if (attemptsHydrated) return;
+  try {
+    const stored = await chrome.storage.local.get(CONSUMED_ATTEMPTS_KEY);
+    const list = stored[CONSUMED_ATTEMPTS_KEY];
+    if (Array.isArray(list)) {
+      for (const item of list) {
+        if (typeof item === "string" && item.length > 0) {
+          consumedBridgeAttempts.add(item);
+        }
+      }
+    }
+  } catch {
+    // Keep existing in-memory set if local storage read fails.
+  }
+  attemptsHydrated = true;
+}
+
+async function persistConsumedAttempts(): Promise<void> {
+  try {
+    await chrome.storage.local.set({
+      [CONSUMED_ATTEMPTS_KEY]: [...consumedBridgeAttempts].slice(-512),
+    });
+  } catch {
+    // Persistence best-effort; memory set still prevents replay in live worker.
+  }
+}
 
 const DEFAULT_CONFIG: BridgeConfig = {
   workerId: "",
@@ -145,6 +175,7 @@ async function initializeBridge(): Promise<void> {
   targetBinding.invalidate(); // MV3 restart never restores stale observations.
   await chrome.action.setBadgeText({text:""});
   await hardenStorageAccess();
+  await hydrateConsumedAttempts();
   await probeChatGptTabs();
 }
 
@@ -281,6 +312,7 @@ async function controllerBridgeConnectAction(rawPolicy: unknown) {
       return { state: "BLOCKED", code: "CONTROLLER_BRIDGE_PERMISSION_NOT_GRANTED" };
     }
 
+    await hydrateConsumedAttempts();
     if (!controllerSupervisor) {
       controllerSupervisor = createControllerBridgeSupervisor(() =>
         connectControllerNativeBridge({
@@ -294,6 +326,7 @@ async function controllerBridgeConnectAction(rawPolicy: unknown) {
             consumeOnce(attemptId: string): boolean {
               if (consumedBridgeAttempts.has(attemptId)) return false;
               consumedBridgeAttempts.add(attemptId);
+              void persistConsumedAttempts();
               return true;
             },
           },
@@ -325,6 +358,7 @@ async function controllerBridgeConnectAction(rawPolicy: unknown) {
             dispatchFirstMessage: async (cmd: ControllerBridgeCommand) => {
               const seen = await targetBinding.current(config.workerId, publicKey.public_key_sha256);
               if (!seen) return { ok: false, code: "TARGET_LOST_BEFORE_DISPATCH" };
+              await persistConsumedAttempts();
               const res = await chrome.tabs.sendMessage(Number(cmd.target_tab_id), {
                 type: CONTENT_DISPATCH_MESSAGE,
                 mode: "FIRST_MESSAGE",
@@ -339,6 +373,7 @@ async function controllerBridgeConnectAction(rawPolicy: unknown) {
             dispatchContinuation: async (cmd: ControllerBridgeCommand) => {
               const seen = await targetBinding.current(config.workerId, publicKey.public_key_sha256);
               if (!seen) return { ok: false, code: "TARGET_LOST_BEFORE_DISPATCH" };
+              await persistConsumedAttempts();
               const res = await chrome.tabs.sendMessage(Number(cmd.target_tab_id), {
                 type: CONTENT_DISPATCH_MESSAGE,
                 mode: "CONTINUATION",

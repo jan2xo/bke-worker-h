@@ -1,0 +1,62 @@
+name: Hydrogen Sandbox CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop-extension-and-contracts:
+    name: Clean Desktop Extension, Native Host & Contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clean isolated browser-extension install and build
+        working-directory: bke-worker/browser-extension
+        run: |
+          npm install --ignore-scripts --no-audit --no-fund --package-lock=false
+          npm run check
+          npm run smoke:native -- --report "$RUNNER_TEMP/desktop-native-smoke-report.json"
+
+      - name: Run certification harness in explicit sandbox dry-run mode
+        working-directory: bke-worker
+        run: |
+          bash scripts/certify-forge-f1-desktop-mvp.sh --sandbox --dry-run
+
+      - name: Verify Cloudflare relay protocol & reconnect recovery planner
+        working-directory: bke-worker/cloudflare-relay
+        run: |
+          npm run check
+          npm run reconnect-recovery-test
+
+      - name: Verify operator, Android & security contracts
+        working-directory: bke-worker
+        run: |
+          python3 tests/forge_f1_desktop_mvp_contract.py
+          python3 tests/chrome_native_host_installer_contract.py
+          python3 tests/operator_entrypoint_contract.py
+          python3 tests/android_gecko_probe_contract.py
+          python3 tests/android_recovery_operator_contract.py
+          python3 tests/cloudflare_relay_contract.py
+          node --test tests/admin_preproduction_activation.test.mjs
+          bash tests/chrome_native_host_installer_contract.sh
