@@ -92,6 +92,7 @@ if (
   manifest.version !== 1 ||
   manifest.package_name !== 'bke-worker-desktop' ||
   manifest.live_send_locked_false !== true ||
+  manifest.execution_envelope_default_disabled !== true ||
   !manifest.files ||
   typeof manifest.files !== 'object' ||
   Array.isArray(manifest.files)
@@ -156,11 +157,15 @@ package_bundle() {
   npm --prefix "$ext_dir" run validate >/dev/null
   npm --prefix "$ext_dir" run controller:build >/dev/null
 
-  # Verify source-level live-send locks remain hard false
+  # Verify source-level live-send locks and feature-gated defaults remain hard false
   grep -q 'export const FIRST_MESSAGE_LIVE_SEND_ENABLED = false as const;' "$ext_dir/src/first-message-actuator.ts" \
     || fail "FIRST_MESSAGE_LIVE_SEND_ENABLED must remain locked false"
   grep -q 'export const CONVERSATION_CONTINUATION_LIVE_SEND_ENABLED = false as const;' "$ext_dir/src/continuation-runtime.ts" \
     || fail "CONVERSATION_CONTINUATION_LIVE_SEND_ENABLED must remain locked false"
+  grep -q '^BKE_HUMAN_LIVE_SEND_AUTHORIZED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
+    || fail "BKE_HUMAN_LIVE_SEND_AUTHORIZED must default false in deploy template"
+  grep -q '^BKE_EXECUTION_ENVELOPE_ENABLED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
+    || fail "BKE_EXECUTION_ENVELOPE_ENABLED must default false in deploy template"
 
   local out_parent
   out_parent="$(dirname -- "$OUT_DIR")"
@@ -237,6 +242,7 @@ const manifest = {
   version: 1,
   package_name: 'bke-worker-desktop',
   live_send_locked_false: true,
+  execution_envelope_default_disabled: true,
   extension_manifest_version: 3,
   file_count: relPaths.length,
   files,

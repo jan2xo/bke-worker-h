@@ -211,6 +211,19 @@ export function signExecutionRequestHmac(
   };
 }
 
+export interface PersistentReplayStore {
+  hasDelivery(deliveryId: string): Promise<boolean> | boolean;
+  hasOrReservedAttempt(attemptId: string): Promise<boolean> | boolean;
+  reserveExecutionRequest(entry: {
+    deliveryId: string;
+    attemptId: string;
+    action: ExecutionAction;
+    headSha: string;
+    prNumber: number;
+  }): Promise<{ ok: true } | { ok: false; code: string }>;
+  recordNonDispatchDelivery?(deliveryId: string): Promise<void>;
+}
+
 export interface ExecutionVerifierConfig {
   expectedRepositoryOwner: string;
   expectedRepositoryName: string;
@@ -219,7 +232,10 @@ export interface ExecutionVerifierConfig {
   expectedWorkerId: string;
   pinnedApp: PinnedDispatcherApp;
   hmacKeysById: ReadonlyMap<string, string>;
+  haltHmacKeysById?: ReadonlyMap<string, string>;
+  allowRemoteHalt?: boolean;
   provider: GitHubAuthorityProvider;
+  replayStore?: PersistentReplayStore;
   nowMs?: () => number;
 }
 
@@ -227,9 +243,54 @@ export class ExecutionRequestVerifier {
   private readonly seenDeliveries = new Set<string>();
   private readonly seenAttempts = new Set<string>();
   private readonly nowMs: () => number;
+  private mutexTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: ExecutionVerifierConfig) {
     this.nowMs = config.nowMs ?? (() => Date.now());
+  }
+
+  private async withExclusiveLock<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prev = this.mutexTail;
+    this.mutexTail = next;
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private resolveKeyForAction(action: ExecutionAction, keyId: string): { ok: true; secret: string } | { ok: false; code: string } {
+    if (action === 'HALT') {
+      if (this.config.allowRemoteHalt !== true) {
+        return { ok: false, code: 'EXEC_REQ_REMOTE_HALT_DISABLED' };
+      }
+      const haltSecret = this.config.haltHmacKeysById?.get(keyId);
+      if (!haltSecret || haltSecret.length < 16) {
+        return { ok: false, code: 'EXEC_REQ_HALT_KEY_UNAUTHORIZED' };
+      }
+      // Prevent accidental or deliberate reuse of ordinary dispatch secrets for HALT
+      const dispatchSecretSameId = this.config.hmacKeysById.get(keyId);
+      if (dispatchSecretSameId === haltSecret) {
+        return { ok: false, code: 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' };
+      }
+      for (const dispatchSecret of this.config.hmacKeysById.values()) {
+        if (dispatchSecret === haltSecret) {
+          return { ok: false, code: 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' };
+        }
+      }
+      return { ok: true, secret: haltSecret };
+    }
+
+    const secret = this.config.hmacKeysById.get(keyId);
+    if (!secret || secret.length < 16) {
+      return { ok: false, code: 'EXEC_REQ_SIGNING_KEY_UNKNOWN' };
+    }
+    return { ok: true, secret };
   }
 
   async verifyAndAuthorize(rawRequest: unknown): Promise<
@@ -255,16 +316,17 @@ export class ExecutionRequestVerifier {
       return { ok: false, code: 'EXEC_REQ_SIGNATURE_ENVELOPE_INVALID' };
     }
 
-    const secret = this.config.hmacKeysById.get(wrapper.key_id);
-    if (!secret || secret.length < 16) {
-      return { ok: false, code: 'EXEC_REQ_SIGNING_KEY_UNKNOWN' };
-    }
-
     const shape = validateExecutionEnvelopeShape(wrapper.envelope);
     if (!shape.ok) {
       return shape;
     }
     const env = shape.envelope;
+
+    const keyResolution = this.resolveKeyForAction(env.action, wrapper.key_id);
+    if (!keyResolution.ok) {
+      return keyResolution;
+    }
+    const secret = keyResolution.secret;
 
     const canonical = serializeCanonicalExecutionEnvelope(env);
     const expectedSig = createHmac('sha256', secret).update(canonical, 'utf8').digest();
@@ -298,90 +360,112 @@ export class ExecutionRequestVerifier {
       return { ok: false, code: 'EXEC_REQ_EXPIRED' };
     }
 
-    if (this.seenDeliveries.has(env.delivery_id)) {
-      return { ok: false, code: 'EXEC_REQ_DELIVERY_REPLAY' };
-    }
-    if (env.action !== 'HALT' && env.action !== 'PREPARE' && this.seenAttempts.has(env.attempt_id)) {
-      return { ok: false, code: 'EXEC_REQ_ATTEMPT_REPLAY' };
-    }
+    return this.withExclusiveLock(async () => {
+      if (this.seenDeliveries.has(env.delivery_id) || (await this.config.replayStore?.hasDelivery(env.delivery_id))) {
+        return { ok: false, code: 'EXEC_REQ_DELIVERY_REPLAY' };
+      }
+      if (
+        env.action !== 'HALT' &&
+        env.action !== 'PREPARE' &&
+        (this.seenAttempts.has(env.attempt_id) || (await this.config.replayStore?.hasOrReservedAttempt(env.attempt_id)))
+      ) {
+        return { ok: false, code: 'EXEC_REQ_ATTEMPT_REPLAY' };
+      }
 
-    // Verify live GitHub installation & repository authority before accepting request
-    const fullRepo = `${env.repository_owner}/${env.repository_name}`;
-    const installCheck = await this.config.provider.verifyInstallationScope(
-      fullRepo,
-      env.repository_id,
-      env.installation_identity,
-    );
-    if (!installCheck.ok) {
-      return { ok: false, code: installCheck.code };
-    }
+      // Verify live GitHub installation & repository authority before accepting request
+      const fullRepo = `${env.repository_owner}/${env.repository_name}`;
+      const installCheck = await this.config.provider.verifyInstallationScope(
+        fullRepo,
+        env.repository_id,
+        env.installation_identity,
+      );
+      if (!installCheck.ok) {
+        return { ok: false, code: installCheck.code };
+      }
 
-    if (env.action === 'HALT') {
-      this.seenDeliveries.add(env.delivery_id);
+      if (env.action === 'HALT') {
+        await this.config.replayStore?.recordNonDispatchDelivery?.(env.delivery_id);
+        this.seenDeliveries.add(env.delivery_id);
+        return {
+          ok: true,
+          code: 'EXECUTION_REQUEST_AUTHORIZED',
+          envelope: env,
+          ticket: {
+            contractVersion: 1,
+            checkRunId: 0,
+            ticketId: `halt:${env.delivery_id}`,
+            attemptId: env.attempt_id,
+            workerId: env.worker_id,
+            expiresAtMs: expiresMs,
+            headSha: env.head_sha,
+          },
+        };
+      }
+
+      const openPrs = await this.config.provider.enumerateOpenAssignedPullRequests(fullRepo, env.worker_id);
+      if (openPrs.length !== 1) {
+        return { ok: false, code: openPrs.length === 0 ? 'GITHUB_PR_NOT_ASSIGNED' : 'GITHUB_WORKER_MULTI_PR_CONFLICT' };
+      }
+      const pr = await this.config.provider.readPullRequest(fullRepo, env.pr_number);
+      if (!pr || pr.state !== 'open') {
+        return { ok: false, code: 'GITHUB_PR_NOT_OPEN' };
+      }
+      if (pr.workerLabels.length !== 1 || pr.workerLabels[0] !== env.worker_id) {
+        return { ok: false, code: 'GITHUB_WORKER_ASSIGNMENT_CONFLICT' };
+      }
+      if (pr.headSha !== env.head_sha) {
+        return { ok: false, code: 'GITHUB_HEAD_SHA_STALE' };
+      }
+
+      const refState = await this.config.provider.readBkeRefState(fullRepo, env.pr_number);
+      if (refState.uncertainAttempts.length > 0) {
+        return { ok: false, code: 'GITHUB_DELIVERY_UNCERTAIN_QUARANTINED' };
+      }
+      if (refState.consumedAttempts.includes(env.attempt_id)) {
+        return { ok: false, code: 'GITHUB_ATTEMPT_ALREADY_CONSUMED' };
+      }
+
+      const ticketRes = await this.config.provider.readPinnedTicket(
+        fullRepo,
+        env.head_sha,
+        env.worker_id,
+        this.config.pinnedApp,
+        new Set(refState.consumedAttempts),
+        now,
+      );
+      if (!ticketRes.ok) {
+        return { ok: false, code: ticketRes.code };
+      }
+      if (ticketRes.ticket.attemptId !== env.attempt_id) {
+        return { ok: false, code: 'EXEC_REQ_TICKET_ATTEMPT_MISMATCH' };
+      }
+
+      if (env.action === 'DISPATCH_FIRST_MESSAGE' || env.action === 'DISPATCH_CONTINUATION') {
+        if (this.config.replayStore) {
+          const reserved = await this.config.replayStore.reserveExecutionRequest({
+            deliveryId: env.delivery_id,
+            attemptId: env.attempt_id,
+            action: env.action,
+            headSha: env.head_sha,
+            prNumber: env.pr_number,
+          });
+          if (!reserved.ok) {
+            return { ok: false, code: reserved.code };
+          }
+        }
+        this.seenDeliveries.add(env.delivery_id);
+        this.seenAttempts.add(env.attempt_id);
+      } else {
+        await this.config.replayStore?.recordNonDispatchDelivery?.(env.delivery_id);
+        this.seenDeliveries.add(env.delivery_id);
+      }
+
       return {
         ok: true,
         code: 'EXECUTION_REQUEST_AUTHORIZED',
         envelope: env,
-        ticket: {
-          contractVersion: 1,
-          checkRunId: 0,
-          ticketId: `halt:${env.delivery_id}`,
-          attemptId: env.attempt_id,
-          workerId: env.worker_id,
-          expiresAtMs: expiresMs,
-          headSha: env.head_sha,
-        },
+        ticket: ticketRes.ticket,
       };
-    }
-
-    const openPrs = await this.config.provider.enumerateOpenAssignedPullRequests(fullRepo, env.worker_id);
-    if (openPrs.length !== 1) {
-      return { ok: false, code: openPrs.length === 0 ? 'GITHUB_PR_NOT_ASSIGNED' : 'GITHUB_WORKER_MULTI_PR_CONFLICT' };
-    }
-    const pr = await this.config.provider.readPullRequest(fullRepo, env.pr_number);
-    if (!pr || pr.state !== 'open') {
-      return { ok: false, code: 'GITHUB_PR_NOT_OPEN' };
-    }
-    if (pr.workerLabels.length !== 1 || pr.workerLabels[0] !== env.worker_id) {
-      return { ok: false, code: 'GITHUB_WORKER_ASSIGNMENT_CONFLICT' };
-    }
-    if (pr.headSha !== env.head_sha) {
-      return { ok: false, code: 'GITHUB_HEAD_SHA_STALE' };
-    }
-
-    const refState = await this.config.provider.readBkeRefState(fullRepo, env.pr_number);
-    if (refState.uncertainAttempts.length > 0) {
-      return { ok: false, code: 'GITHUB_DELIVERY_UNCERTAIN_QUARANTINED' };
-    }
-    if (refState.consumedAttempts.includes(env.attempt_id)) {
-      return { ok: false, code: 'GITHUB_ATTEMPT_ALREADY_CONSUMED' };
-    }
-
-    const ticketRes = await this.config.provider.readPinnedTicket(
-      fullRepo,
-      env.head_sha,
-      env.worker_id,
-      this.config.pinnedApp,
-      new Set(refState.consumedAttempts),
-      now,
-    );
-    if (!ticketRes.ok) {
-      return { ok: false, code: ticketRes.code };
-    }
-    if (ticketRes.ticket.attemptId !== env.attempt_id) {
-      return { ok: false, code: 'EXEC_REQ_TICKET_ATTEMPT_MISMATCH' };
-    }
-
-    this.seenDeliveries.add(env.delivery_id);
-    if (env.action === 'DISPATCH_FIRST_MESSAGE' || env.action === 'DISPATCH_CONTINUATION') {
-      this.seenAttempts.add(env.attempt_id);
-    }
-
-    return {
-      ok: true,
-      code: 'EXECUTION_REQUEST_AUTHORIZED',
-      envelope: env,
-      ticket: ticketRes.ticket,
-    };
+    });
   }
 }

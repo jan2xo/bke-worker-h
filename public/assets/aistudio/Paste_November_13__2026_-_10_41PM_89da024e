@@ -1,0 +1,1101 @@
+# BKE WORKER — HYDROGEN F2 ENGINEERING CONTINUATION MANDATE
+
+**Mission:** Complete the authenticated GitHub App integration boundary, strengthen desktop execution authority, and prepare BKE Worker for independent operational acceptance.
+
+**Executor:** Gemini Hydrogen — Google AI Studio
+
+**Assigned engineering repository:** https://github.com/jan2xo/bke-worker-h
+
+**Canonical reference repository:** https://github.com/jan2xo/bke-worker
+
+**Command Center reference:** https://github.com/jan2xo/bke-command-center
+
+**Date:** November 13, 2026
+
+**Execution mode:** Autonomous engineering within an isolated, GitHub-synchronized workspace.
+
+**Expected output:** Verified implementation, passing GitHub CI, and a detailed engineering knowledge-transfer document.
+
+---
+
+# 0. EXECUTIVE ORDER
+
+Hydrogen, you have completed the first major engineering stage of BKE Worker.
+
+Your F1 implementation achieved successful GitHub-hosted source certification and produced an extensive engineering handoff.
+
+**Do not restart the project.**
+
+**Do not regenerate the implementation.**
+
+**Do not replace the existing architecture with an unrelated orchestration framework.**
+
+Your next responsibility is to reconcile the remaining F1 limitations and complete the Worker-side integration required for BKE's existing GitHub App.
+
+The objective is to move from:
+
+**A locally connected and CI-verified desktop Worker**
+
+toward:
+
+**A Worker with an authenticated, renewable, GitHub-authoritative execution path that is ready for owner-supervised live acceptance.**
+
+Continue engineering through repeated implementation, testing, and GitHub verification cycles for as long as the environment permits.
+
+Ordinary local engineering decisions do not require repeated owner confirmation.
+
+External security, provider, credential, production, and human-authentication decisions remain owner-controlled.
+
+---
+
+# 1. VERIFIED ENGINEERING BASELINE
+
+## 1.1 Current repository state
+
+Assigned repository:
+
+`jan2xo/bke-worker-h`
+
+Current verified GitHub main:
+
+`66121870f383f6aac8d7ef4cbb21a0569a39b9a8`
+
+The handoff-only commit follows the implementation commit:
+
+`bbf40c92f0a9a3776143556c0734421980f3e4a4`
+
+Latest successful GitHub Actions run:
+
+https://github.com/jan2xo/bke-worker-h/actions/runs/43439129656
+
+Original implementation green CI:
+
+https://github.com/jan2xo/bke-worker-h/actions/runs/43435024253
+
+Both runs completed successfully.
+
+**Refresh GitHub state before editing. Do not assume these SHAs remain current.**
+
+## 1.2 Read your previous handoff
+
+Before implementing F2, read:
+
+`bke-worker/docs/HYDROGEN_BKE_WORKER_ENGINEERING_HANDOFF.md`
+
+This is your previous engineering knowledge transfer.
+
+Recover its implementation inventory, security assumptions, architecture, unresolved defects, test commands, and operator acceptance requirements.
+
+Do not discard that work.
+
+## 1.3 Preserved F1 accomplishments
+
+The following are existing foundations, not tasks to regenerate:
+
+- Clean TypeScript compilation with separate browser and Node environments.
+- WebExtension source and protocol implementation.
+- Native messaging host and P-256 authentication.
+- Local desktop controller daemon.
+- Unix IPC bridge.
+- Persistent execution journal.
+- GitHub F1 ledger.
+- First-message and continuation runtimes.
+- Synthetic two-turn orchestration.
+- GitHub App execution-envelope verification harness.
+- Command Center read-only observer adapter.
+- Adversarial security and reliability tests.
+- Desktop packaging and operator scripts.
+- Hydrogen Sandbox CI.
+- Android source reconciliation.
+- Canonical promotion plan.
+
+Preserve passing behavior while making focused changes.
+
+---
+
+# 2. YOUR REPOSITORY AUTHORITY
+
+## Writable repository
+
+You may implement and synchronize verified engineering changes to:
+
+`jan2xo/bke-worker-h`
+
+This Google AI Studio project is already connected to that GitHub repository.
+
+Use the existing AI Studio GitHub synchronization functionality.
+
+After each meaningful milestone:
+
+1. Finish the local implementation.
+2. Run the appropriate local tests.
+3. Synchronize the intended changes to GitHub.
+4. Read back the actual GitHub commit SHA.
+5. Inspect the corresponding automatically triggered GitHub Actions run.
+6. Repair any causal failure.
+7. Repeat until the relevant sandbox gates pass.
+
+Do not claim successful synchronization without read-back evidence.
+
+## Read-only repositories
+
+Do not modify:
+
+- `jan2xo/bke-worker`
+- `jan2xo/bke-command-center`
+- `jan2xo/bke-autonomous-engineering`
+- `jan2xo/bke-engineering-standard`
+- Any other existing BKE repository
+
+Do not deploy Cloudflare services.
+
+Do not alter GitHub App installations, permissions, private keys, or provider secrets.
+
+Do not enable production or PREPRODUCTION features.
+
+Do not send live ChatGPT messages.
+
+Do not merge or release.
+
+Sandbox development is authorized; crossing security boundaries is not.
+
+---
+
+# 3. F2 OBJECTIVES AND PRIORITY
+
+Complete the following stages in order.
+
+| Stage | Assignment | Priority |
+|---|---|---|
+| F2-01 | Fix emergency halt and response-contract discrepancies | P0 |
+| F2-02 | Integrate authenticated execution-envelope verification into desktop controller | P0 |
+| F2-03 | Implement production-shaped GitHub authority provider adapter | P0 |
+| F2-04 | Introduce safe short-lived credential renewal architecture | P0 |
+| F2-05 | Harden persistent replay, idempotency, and uncertain-delivery boundaries | P0 |
+| F2-06 | Validate Command Center observer compatibility | P1 |
+| F2-07 | Extend multi-process integration and adversarial tests | P0 |
+| F2-08 | Update desktop packaging, operator diagnostics, and acceptance procedures | P1 |
+| F2-09 | Reconcile canonical promotion requirements | P1 |
+| F2-10 | Deliver final GitHub-verified engineering handoff | P0 |
+
+Completing a stage means producing source code and test evidence, not only documentation.
+
+If a stage depends on an unavailable external authorization or undeployed service, finish the complete safe local implementation and classify the external dependency as BLOCKED.
+
+Continue with other independent work.
+
+---
+
+# 4. F2-01 — EMERGENCY HALT CONTRACT CORRECTION
+
+Your previous engineering report identified a concrete mismatch.
+
+## Actual source
+
+`bke-worker/browser-extension/native-host/claim/controller-daemon.ts`
+
+The current `POST /halt` implementation reads:
+
+`x-bke-halt-token`
+
+However, the operator documentation describes:
+
+`Authorization: Bearer`
+
+The runtime also returns HTTP `409` for blocked execution, while the documentation refers to HTTP `423`.
+
+## Required correction
+
+Reconcile the actual code and documentation.
+
+Prefer preserving the currently implemented halt-authentication header unless an independently supported reason justifies changing the runtime contract.
+
+Required acceptance:
+
+- The documented owner halt command works as implemented.
+- Missing halt token is rejected.
+- Incorrect halt token is rejected.
+- Timing-safe verification remains intact.
+- Remote untrusted requests cannot halt another worker.
+- No credentials appear in logs or response bodies.
+- The documented blocked/quarantined response matches the code.
+- Regression tests cover the operator examples.
+- Emergency halt remains functional when ordinary dispatch is blocked.
+
+Do not introduce a security downgrade merely to make documentation pass.
+
+The owner must be able to stop the Worker reliably.
+
+---
+
+# 5. F2-02 — AUTHENTICATED EXECUTION-ENVELOPE INTEGRATION
+
+## Existing implementation
+
+File:
+
+`bke-worker/browser-extension/native-host/claim/github-app-harness.ts`
+
+Existing symbols:
+
+- `EXECUTION_REQUEST_PROTOCOL_VERSION`
+- `AUTHORIZED_CAPABILITY_V1`
+- `ExecutionRequestEnvelopeV1`
+- `SignedExecutionRequestV1`
+- `GitHubAuthorityProvider`
+- `ExecutionRequestVerifier`
+- `serializeCanonicalExecutionEnvelope`
+- `validateExecutionEnvelopeShape`
+- `signExecutionRequestHmac`
+
+Current protocol version:
+
+`1`
+
+Current capability:
+
+`GITHUB_F1_EXECUTION_V1`
+
+Actions:
+
+```typescript
+type ExecutionAction =
+  | 'PREPARE'
+  | 'DISPATCH_FIRST_MESSAGE'
+  | 'DISPATCH_CONTINUATION'
+  | 'HALT';
+```
+
+The existing envelope contains 14 fields:
+
+```text
+protocol_version
+repository_owner
+repository_name
+repository_id
+installation_identity
+worker_id
+pr_number
+head_sha
+attempt_id
+delivery_id
+action
+issued_at
+expires_at
+authorized_capability
+```
+
+## Existing gap
+
+The authenticated envelope verifier is implemented and tested independently.
+
+However:
+
+`DesktopControllerDaemon`
+
+currently processes ordinary GitHub webhook events through:
+
+`POST /webhooks/github`
+
+with `X-Hub-Signature-256` verification and subsequent controller processing.
+
+**The new `ExecutionRequestVerifier` is not connected to the actual daemon execution path.**
+
+## Required implementation
+
+Introduce a deliberate, isolated integration path through which a trusted server-side authority can submit authenticated execution requests.
+
+Do not confuse ordinary GitHub webhook authentication with permission to execute a ChatGPT turn.
+
+A correctly signed GitHub webhook proves an event originated from the webhook sender. It is not, by itself, an independently verified, scoped execution authorization.
+
+### Required properties
+
+Before a signed execution request can reach the controller:
+
+1. Validate the exact protocol version and wrapper.
+2. Verify cryptographic authenticity.
+3. Verify the trusted signing-key identity.
+4. Verify the intended repository and installation.
+5. Verify the worker ID.
+6. Verify the exact PR.
+7. Verify the current GitHub head SHA.
+8. Verify exclusive worker assignment.
+9. Verify the current pinned execution ticket.
+10. Verify absence of consumed or uncertain attempts.
+11. Validate issued-at and expiry bounds.
+12. Reject duplicate delivery and attempt IDs.
+13. Bind the accepted authorization to a single controller action.
+14. Preserve the existing execution journal and send-once fencing.
+
+### Integration constraints
+
+Implement the actual controller integration only through a feature-gated path that is **OFF by default**.
+
+The signed request must originate from a genuinely trusted server-side authority.
+
+Do not allow the desktop client or browser to mint its own execution authorization.
+
+Do not expose the HMAC signing key through Chrome, the MV3 extension, GitHub comments, or public API responses.
+
+Do not reuse the GitHub webhook secret as the execution-envelope signing secret without a separately justified and authorized key-management design.
+
+Do not invent a live broker endpoint that does not exist.
+
+If no trusted broker signer is available, provide a complete local mock-backed integration and leave external activation blocked.
+
+### HALT-specific review
+
+`HALT` has different authority requirements from ordinary dispatch.
+
+Review the existing `ExecutionRequestVerifier` HALT branch carefully.
+
+It must not permit an arbitrary holder of a general dispatch capability to gain unrestricted emergency-control privileges.
+
+Keep the owner-controlled local emergency halt separate from remote worker execution authorization.
+
+### Acceptance
+
+A valid simulated trusted execution envelope reaches the correct controller action.
+
+Every malformed, stale, replayed, unauthorized, or cross-worker envelope is rejected before dispatch.
+
+No unauthorized browser call occurs.
+
+---
+
+# 6. F2-03 — REAL GITHUB AUTHORITY PROVIDER ADAPTER
+
+## Current interface
+
+The existing `GitHubAuthorityProvider` defines:
+
+```typescript
+verifyInstallationScope(...)
+readPullRequest(...)
+enumerateOpenAssignedPullRequests(...)
+readPinnedTicket(...)
+readBkeRefState(...)
+```
+
+This interface currently supports the standalone execution verifier.
+
+The existing `GitHubF1Ledger` already contains significant authenticated GitHub REST functionality.
+
+## Engineering objective
+
+Reconcile these components.
+
+Avoid duplicating full GitHub-provider implementations when existing code can be safely reused.
+
+Build an adapter that implements the authority interface using the real provider contracts already present in the codebase.
+
+### Requirements
+
+- Use authenticated GitHub REST data.
+- Verify the exact installation and repository scope.
+- Validate the expected repository ID.
+- Enumerate all relevant open PR assignments.
+- Reject incomplete pagination.
+- Verify the target PR remains open.
+- Reject multiple `bke-worker:` labels.
+- Reject worker ownership conflicts.
+- Verify current head SHA.
+- Validate pinned `bke-ticket:v1` evidence.
+- Verify consumed-attempt and uncertainty refs.
+- Reject incomplete or malformed provider responses.
+- Fail closed on API outages or rate limiting.
+
+Avoid treating a synthetic provider response as authoritative when running in an operational mode.
+
+### Important integration concern
+
+The existing GitHub ledger performs both authority inspection and execution-related Git operations.
+
+Do not accidentally grant a read-only authorization verifier permission to mutate GitHub.
+
+Keep read authority separate from claim/receipt write capability.
+
+Explicitly document which operations require GitHub Contents, Issues, Pull Requests, or Checks permissions.
+
+Grant no broader scope than actually required.
+
+### Acceptance
+
+Build a provider integration test harness that uses a local GitHub-compatible HTTP fixture.
+
+Cover realistic REST pagination, stale reads, changed assignment, permission errors, malformed bodies, 401, 403, 404, 409, 422, 429, and 5xx responses.
+
+No live GitHub App credentials are necessary for source certification.
+
+---
+
+# 7. F2-04 — SHORT-LIVED TOKEN LIFECYCLE
+
+## Existing limitation
+
+Current daemon CLI wiring:
+
+`controller-daemon.ts`
+
+uses:
+
+```typescript
+tokenProvider: async () =>
+  process.env.BKE_GITHUB_INSTALLATION_TOKEN ?? ''
+```
+
+This is not an automatic credential-renewal mechanism.
+
+GitHub App installation tokens expire.
+
+Long-running unattended Workers cannot depend indefinitely on a static token supplied at process startup.
+
+## Required solution
+
+Design and implement a credential-provider interface capable of:
+
+- Returning a valid scoped token from a trusted server-side authority.
+- Respecting actual provider expiry.
+- Refreshing before expiration when authorized.
+- Enforcing repository and installation scope.
+- Preventing concurrent refresh storms.
+- Supporting cancellation and bounded timeouts.
+- Rejecting invalid or unexpectedly elevated permissions.
+- Handling broker downtime.
+- Handling revoked credentials.
+- Rejecting stale or ambiguous responses.
+- Avoiding secrets in logs, exceptions, or telemetry.
+
+### Critical trust boundary
+
+The existing BKE GitHub App is managed through Cloudflare-side private infrastructure.
+
+Do not send the App private key to the desktop.
+
+Do not place a global Admin PAT on the desktop.
+
+Do not expose an installation token to the browser extension.
+
+Do not use the existing Actions OIDC installation-token broker as an arbitrary desktop token endpoint.
+
+Do not modify Cloudflare relay source or deployed configuration in this mission.
+
+### Implementation approach
+
+Build a provider-independent token lifecycle adapter.
+
+Use a deterministic mock broker that simulates:
+
+- Successful issuance.
+- Scheduled expiry.
+- Safe renewal.
+- Revocation.
+- Wrong installation.
+- Wrong repository.
+- Elevated permissions.
+- Late response.
+- Concurrent refresh.
+- Provider unavailability.
+- Token expiration during claim creation.
+
+Allow future integration through an approved authenticated transport, but leave that transport disabled until the owner authorizes and certifies the server-side broker contract.
+
+### Important distinction
+
+A token-refresh interface is not proof that the actual BKE GitHub App broker supports desktop refresh.
+
+Report these states separately:
+
+- Token lifecycle interface implemented.
+- Mock broker tests passed.
+- Trusted real broker API available.
+- Real broker transport connected.
+- Real GitHub App renewal certified.
+
+Do not claim all five from the first two.
+
+---
+
+# 8. F2-05 — PERSISTENT REPLAY AND DELIVERY GUARANTEES
+
+## Existing state
+
+`ExecutionRequestVerifier` maintains:
+
+```typescript
+private readonly seenDeliveries = new Set<string>();
+private readonly seenAttempts = new Set<string>();
+```
+
+These are in-memory replay guards.
+
+**They do not, by themselves, survive process restarts.**
+
+Your existing F1 journal and GitHub attempt ledger provide additional durable state, but the boundary between the verifier's in-memory records and the durable dispatch transaction requires explicit review.
+
+## Required engineering work
+
+Evaluate and correct any gaps involving:
+
+- Duplicate signed requests after restart.
+- Two concurrent signed requests for one attempt.
+- Crash after authorization but before reservation.
+- Crash after reservation but before browser dispatch.
+- Crash after browser dispatch but before receipt.
+- GitHub CAS conflict.
+- Ambiguous GitHub write success.
+- IPC bridge disconnect.
+- Browser click outcome unknown.
+- Replay after key rotation.
+- Out-of-order event delivery.
+
+Use durable attempts, claims, or journal records where justified.
+
+Do not introduce a second independent task database.
+
+**The authoritative engineering records remain in GitHub.** Local storage may retain bounded safety state and crash recovery evidence.
+
+### Atomicity requirement
+
+Avoid the unsafe pattern:
+
+```text
+Verify authorization
+    ↓
+Allow another process to claim
+    ↓
+Begin dispatch
+```
+
+without a durable reservation and fresh ownership check.
+
+Required guarantee:
+
+**At most one potentially delivered execution per authorized attempt, even across restart and concurrency races.**
+
+If this cannot be proved in a specific failure window, quarantine the attempt instead of claiming exactly-once delivery.
+
+Do not confuse at-most-once dispatch with exactly-once successful delivery.
+
+### Required adversarial tests
+
+Test:
+
+- Parallel verifier instances.
+- Parallel daemon instances.
+- Same attempt, different delivery IDs.
+- Same delivery, different attempt IDs.
+- Clock-skew boundary.
+- Key rotation during request processing.
+- Process restart before acknowledgment.
+- Journal corruption.
+- GitHub API conflict.
+- Read-back mismatch.
+- Pending uncertain claim.
+- Browser connection lost after send initiation.
+
+A test passes only if the resulting behavior is correct under the intended safety contract.
+
+---
+
+# 9. F2-06 — COMMAND CENTER COMPATIBILITY
+
+Command Center remains read-first and GitHub-derived.
+
+Reference:
+
+`jan2xo/bke-command-center`
+
+Existing Worker-side adapter:
+
+`command-center-observer.ts`
+
+Existing documentation:
+
+`docs/command-center-compatibility.md`
+
+## Assignment
+
+Verify that the new authenticated execution flow produces evidence compatible with the existing read-only observer architecture.
+
+Required visible states include:
+
+- Worker identity verified.
+- Worker identity unknown.
+- PR assignment valid.
+- PR ownership conflict.
+- Current exact SHA.
+- Stale SHA.
+- Claim reserved.
+- Execution blocked.
+- Delivery uncertain.
+- First conversation confirmed.
+- Continuation confirmed.
+- Exact-head CI pending or failed.
+- Evidence incomplete.
+- Worker liveness unknown.
+
+Do not invent Command Center endpoints.
+
+Do not modify Command Center.
+
+Do not make Command Center a dispatcher.
+
+If a new observer API or source change will eventually be necessary, document its exact requirements for a separately authorized Command Center engineering task.
+
+### Fail-closed contract
+
+Missing evidence is UNKNOWN.
+
+An inactive paired worker is not a running worker.
+
+A verified GitHub assignment is not proof of browser connectivity.
+
+A valid token is not proof of successful ChatGPT login.
+
+A passing synthetic test is not proof of live message delivery.
+
+---
+
+# 10. F2-07 — MULTI-PROCESS AND SECURITY CERTIFICATION
+
+Extend the existing integration tests rather than creating another disconnected suite.
+
+Existing foundation:
+
+`controller-daemon.test.mjs`
+
+`github-app-harness.test.mjs`
+
+`reliability-adversarial.test.mjs`
+
+`e2e-two-turn-acceptance.test.mjs`
+
+## Required full synthetic path
+
+```text
+Trusted simulated server authority
+    ↓
+Signed execution request
+    ↓
+ExecutionRequestVerifier
+    ↓
+Real authority-provider adapter with mock HTTP backend
+    ↓
+Exclusive GitHub claim
+    ↓
+DesktopControllerDaemon
+    ↓
+FileExecutionJournal
+    ↓
+IpcBridgeClient
+    ↓
+Native controller bridge
+    ↓
+MV3 extension adapter
+    ↓
+Synthetic authenticated ChatGPT target
+    ↓
+Turn 1
+    ↓
+Durable conversation receipt
+    ↓
+Distinct authorized continuation
+    ↓
+Turn 2, same conversation
+```
+
+Every listed transition must execute through real integrated code wherever practical, with mocks confined to the external GitHub, broker, and ChatGPT boundaries.
+
+### Mandatory negative tests
+
+- Invalid signature.
+- Wrong key ID.
+- Invalid protocol version.
+- Missing fields.
+- Extra fields.
+- Wrong installation.
+- Wrong repository.
+- Wrong worker.
+- Wrong PR.
+- Stale SHA.
+- Wrong action.
+- Expired request.
+- Replayed request.
+- Already-consumed attempt.
+- Ambiguous GitHub claim.
+- Two simultaneous requests.
+- Expired broker token.
+- Revoked broker token.
+- Unauthorized HALT.
+- Mid-send controller crash.
+- Uncertain browser delivery.
+- Cross-conversation continuation.
+- Restart and duplicate replay.
+
+The correct failure mode is rejection or quarantine, not an automatic duplicate attempt.
+
+### CI evidence requirement
+
+GitHub-hosted tests must exercise the real newly connected code.
+
+Do not use a test that only instantiates `ExecutionRequestVerifier` in isolation as proof that the daemon integration is complete.
+
+---
+
+# 11. F2-08 — OPERATOR PACKAGING AND DIAGNOSTICS
+
+Keep the desktop software usable without exposing security-sensitive configuration.
+
+Update where necessary:
+
+- `scripts/package-desktop-worker.sh`
+- `docs/desktop-operator-acceptance.md`
+- `deploy/desktop-controller.env.example`
+- `deploy/owner-native-policy.template.json`
+- Controller doctor/status commands.
+
+The operator should be able to identify:
+
+- Current repository.
+- Worker ID.
+- Active PR.
+- Expected head SHA.
+- Controller running state.
+- Native transport readiness.
+- Signed execution-envelope support.
+- Whether trusted server authority is configured.
+- Whether a credential provider is available.
+- Whether the journal is quarantined.
+- Live-send state.
+- Missing owner-only prerequisites.
+
+Do not display tokens, private key material, cookies, browser profile contents, or unnecessary local paths.
+
+Ensure the emergency stop documentation is accurate.
+
+Preserve safe uninstall behavior.
+
+Do not generate a package that silently activates live execution.
+
+---
+
+# 12. F2-09 — CANONICAL PROMOTION RECONCILIATION
+
+The engineering sandbox is not the canonical operational repository.
+
+Your current working repository:
+
+`jan2xo/bke-worker-h`
+
+The eventual promotion target:
+
+`jan2xo/bke-worker`
+
+The canonical repository still has the MVP governance rules defined by issue #149.
+
+## Required deliverable
+
+Update the dependency-ordered promotion plan to include F2.
+
+Account for:
+
+- Previously completed F1 work.
+- F2 source dependencies.
+- GitHub App verifier integration.
+- Durable replay protection.
+- Token lifecycle abstraction.
+- New test coverage.
+- Documentation alignment.
+- Existing 500-line changed-line scope gate.
+- Frozen Cloudflare/Android/.NET paths.
+- Owner-only exceptions.
+- Exact-head CI requirements.
+
+Verify actual changed-line counts before proposing PR boundaries.
+
+The existing seven-PR promotion plan is a starting point, not a guarantee that every PR satisfies the scope gate.
+
+Do not create or merge canonical PRs during this mission.
+
+Do not reuse the oversized historical draft PR as a shortcut.
+
+Prepare a safe promotion package and provide exact source revision evidence.
+
+---
+
+# 13. STRICT CONTINUATION RULES
+
+## 13.1 Keep all live execution disabled
+
+Preserve:
+
+```typescript
+FIRST_MESSAGE_LIVE_SEND_ENABLED = false as const;
+```
+
+Preserve:
+
+```typescript
+CONVERSATION_CONTINUATION_LIVE_SEND_ENABLED = false as const;
+```
+
+Preserve:
+
+```typescript
+humanLiveSendAuthorized: false
+```
+
+as the default runtime behavior.
+
+Do not enable these flags to satisfy tests.
+
+Do not perform actual ChatGPT sends.
+
+Do not simulate a human owner authorization by setting an environment variable inside CI.
+
+## 13.2 No external privilege changes
+
+No GitHub App installation changes.
+
+No Cloudflare secret writes.
+
+No PREPRODUCTION deployment.
+
+No broker permission escalation.
+
+No browser credential extraction.
+
+No production route changes.
+
+No unauthorized repository mutations.
+
+## 13.3 Keep working through available phases
+
+Do not stop after fixing `/halt`.
+
+Do not stop after introducing a new interface.
+
+Do not stop after unit tests pass.
+
+Continue through:
+
+```text
+Inspect → Implement → Integrate → Test
+→ Break → Repair → Clean Build
+→ GitHub Sync → GitHub CI
+→ Review → Document
+```
+
+If the environment permits substantial continued execution, keep resolving independent engineering tasks.
+
+If an external authority dependency prevents full live integration, finish the safe adapter, mocks, negative tests, and documented integration contract.
+
+Do not invent a workaround that weakens authorization.
+
+---
+
+# 14. VERIFICATION COMMANDS
+
+From the assigned repository, use the actual nested BKE Worker source.
+
+Initial baseline:
+
+```bash
+cd bke-worker/browser-extension
+
+npm run build
+npm run validate
+npm test
+npm run test:native
+npm run test:host-claim
+npm run check
+npm run controller:doctor
+npm run smoke:native
+```
+
+Sandbox certification from `bke-worker/`:
+
+```bash
+bash scripts/certify-forge-f1-desktop-mvp.sh --sandbox --dry-run
+```
+
+Input-only lint:
+
+```bash
+node scripts/input-only-lint.mjs
+node --test scripts/input-only-lint.test.mjs
+```
+
+Cloudflare source regression:
+
+```bash
+npm --prefix cloudflare-relay run check
+npm --prefix cloudflare-relay run reconnect-recovery-test
+```
+
+Also run:
+
+- GitHub App harness tests.
+- Provider adapter tests.
+- Token lifecycle tests.
+- Signed-envelope-to-daemon integration tests.
+- Persistent replay/concurrency tests.
+- Operator halt tests.
+- Existing Python/Bash contracts.
+- Desktop packaging/verification/cleanup checks.
+
+Update `hydrogen-sandbox-ci.yml` to exercise relevant new integration tests.
+
+Use minimal GitHub Actions permissions.
+
+Do not introduce secrets or privileged workflows merely to obtain CI proof.
+
+**All source checks must run after the final code edit.**
+
+Then synchronize to GitHub and inspect the exact commit's resulting workflow.
+
+Green CI from an older commit does not certify later F2 changes.
+
+---
+
+# 15. ENGINEERING CHECKPOINTS
+
+Maintain a durable execution record.
+
+For each completed milestone:
+
+```text
+BKE HYDROGEN F2 CHECKPOINT
+
+PHASE:
+GITHUB BASE SHA:
+CURRENT SOURCE SHA:
+IMPLEMENTED FILES:
+MODIFIED INTERFACES:
+RUNTIME PATHS CONNECTED:
+LOCAL TESTS:
+GITHUB CI RUN:
+SECURITY INVARIANTS:
+REMAINING DEFECTS:
+EXTERNAL BLOCKERS:
+SMALLEST SAFE NEXT ACTION:
+```
+
+If AI Studio approaches a session limit, save and synchronize the completed work and leave a clear checkpoint for continuation.
+
+Do not imply that work continues after the runtime has actually stopped.
+
+Do not invent test evidence.
+
+---
+
+# 16. REQUIRED FINAL ENGINEERING HANDOFF
+
+Create:
+
+`HYDROGEN_BKE_WORKER_F2_ENGINEERING_HANDOFF.md`
+
+Place it at:
+
+`bke-worker/docs/HYDROGEN_BKE_WORKER_F2_ENGINEERING_HANDOFF.md`
+
+This is a **new F2 document**, separate from the previous F1 engineering report.
+
+Make it available through the connected GitHub repository and, if supported, as a downloadable Markdown file.
+
+## Required sections
+
+1. Executive summary and actual F2 completion status.
+2. Verified GitHub baseline and final SHAs.
+3. Exact files modified.
+4. Emergency halt contract repair.
+5. Authenticated execution-envelope integration.
+6. Real GitHubAuthorityProvider adapter.
+7. Token lifecycle and broker contract.
+8. Persistent replay and delivery guarantees.
+9. Command Center compatibility.
+10. Full synthetic multi-process execution trace.
+11. Threat model and security boundaries.
+12. GitHub CI history and exact test counts.
+13. Remaining unverified external integrations.
+14. Canonical promotion plan.
+15. Owner-only operational acceptance requirements.
+16. Independent GPT-6 review checklist.
+17. Final machine-readable completion capsule.
+
+## Mandatory completion capsule
+
+```json
+{
+  "schema": "bke.hydrogen.f2.handoff.v1",
+  "engineering_repo": "jan2xo/bke-worker-h",
+  "base_sha": null,
+  "final_sha": null,
+  "github_ci_run": null,
+  "halt_contract": "NOT_VERIFIED",
+  "signed_envelope_daemon_integration": "NOT_VERIFIED",
+  "github_authority_provider": "NOT_VERIFIED",
+  "token_lifecycle": "NOT_VERIFIED",
+  "real_broker_connection": "NOT_AUTHORIZED",
+  "persistent_replay_safety": "NOT_VERIFIED",
+  "command_center_compatibility": "NOT_VERIFIED",
+  "synthetic_two_turn": "NOT_VERIFIED",
+  "real_chrome_two_turn": "NOT_RUN",
+  "live_send_enabled": false,
+  "canonical_repo_modified": false,
+  "command_center_modified": false,
+  "production_modified": false,
+  "known_blockers": [],
+  "next_safe_action": null
+}
+```
+
+Replace placeholders only with actual verified facts.
+
+Do not report `PASS` when the corresponding test was not executed.
+
+Distinguish:
+
+- IMPLEMENTED
+- UNIT VERIFIED
+- INTEGRATION VERIFIED
+- GITHUB CI VERIFIED
+- EXTERNAL BLOCKED
+- HUMAN ACCEPTANCE REQUIRED
+
+---
+
+# 17. FINAL MISSION DIRECTIVE
+
+Hydrogen, F1 established that you can build an extensive desktop Worker and achieve clean GitHub CI.
+
+**F2 must prove that its security components form an integrated authorization path, rather than disconnected libraries with individually passing tests.**
+
+Your top priorities are:
+
+1. Correct the known operator defects.
+2. Connect the authenticated execution verifier.
+3. Integrate real provider-shaped GitHub authority.
+4. Design and test secure expiring-token lifecycle behavior.
+5. Guarantee fail-closed replay and delivery handling.
+6. Validate compatibility with Command Center.
+7. Run complete multi-process integration tests.
+8. Synchronize all verified changes to `bke-worker-h`.
+9. Obtain successful exact-commit GitHub CI.
+10. Produce the formal F2 engineering knowledge transfer.
+
+Preserve the original BKE system.
+
+Preserve your completed F1 implementation.
+
+Preserve human-controlled live execution.
+
+**DO NOT JUST DESIGN THE INTEGRATION. IMPLEMENT EVERYTHING THAT CAN SAFELY BE IMPLEMENTED IN YOUR SANDBOX.**
+
+**DO NOT CLAIM THE REAL BROKER IS CONNECTED UNTIL IT ACTUALLY IS.**
+
+**CONTINUE ENGINEERING. VERIFY THE WORK. REPORT EXACT EVIDENCE.**
+
+**BEGIN F2.**

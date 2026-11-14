@@ -6,11 +6,13 @@ import assert from 'node:assert/strict';
 
 import {
   COMMAND_CENTER_COMPATIBILITY_MATRIX,
+  F2_REQUIRED_VISIBLE_STATES,
   projectWorkerStateForCommandCenter,
 } from '../dist/native-host/claim/command-center-observer.js';
 
 const NOW = Date.parse('2026-10-20T12:00:00.000Z');
 const HEAD = 'a'.repeat(40);
+const STALE_HEAD = 'b'.repeat(40);
 
 function baseEvidence(overrides = {}) {
   return {
@@ -123,4 +125,65 @@ test('Workstream D: 8 fail-closed observer scenarios never forge readiness or PA
   assert.equal(s8.pairingState, 'UNKNOWN');
   assert.equal(s8.executionState, 'UNKNOWN');
   assert.equal(s8.dispatchReady, false);
+});
+
+test('F2-06: Covers all 14 required visible states and fail-closed token/pairing/browser/synthetic separation', () => {
+  assert.equal(F2_REQUIRED_VISIBLE_STATES.length, 14);
+  const observedTags = new Set();
+
+  const collect = (ev) => {
+    const p = projectWorkerStateForCommandCenter(ev);
+    for (const tag of p.visibleStates) observedTags.add(tag);
+    return p;
+  };
+
+  // Valid exact-SHA + verified identity + valid assignment
+  const ready = collect(baseEvidence({ expectedHeadSha: HEAD, exactHeadCi: { status: 'PASS' }, tokenLifecycle: { valid: true, brokerConnected: false } }));
+  assert.equal(ready.identityState, 'VERIFIED');
+  assert.equal(ready.shaState, 'CURRENT_EXACT');
+  assert.equal(ready.workerLiveness, 'ALIVE');
+
+  // Stale SHA + exact-head CI pending + claim reserved
+  const stale = collect(baseEvidence({
+    expectedHeadSha: STALE_HEAD,
+    exactHeadCi: { status: 'PENDING' },
+    journal: { phase: 'RESERVED', conversationId: null, confirmedTurnCount: 0, uncertainReason: null },
+  }));
+  assert.equal(stale.shaState, 'STALE');
+  assert.equal(stale.claimState, 'RESERVED');
+  assert.equal(stale.dispatchReady, false);
+
+  // Valid token does NOT prove ChatGPT auth or browser connectivity
+  const tokNoBrowser = collect(baseEvidence({
+    tokenLifecycle: { valid: true, brokerConnected: true },
+    pairing: undefined,
+    browser: undefined,
+  }));
+  assert.equal(tokNoBrowser.identityState, 'UNKNOWN');
+  assert.equal(tokNoBrowser.chatgptAuthState, 'UNKNOWN');
+  assert.equal(tokNoBrowser.evidenceIncomplete, true);
+  assert.equal(tokNoBrowser.workerLiveness, 'UNKNOWN');
+  assert.equal(tokNoBrowser.dispatchReady, false);
+
+  // Ownership conflict & delivery uncertain & paired idle
+  collect(baseEvidence({
+    githubAssignment: {
+      repository: 'jan2xo/bke-worker', prNumber: 149, workerId: 'worker-f1', headSha: HEAD,
+      openPrCountForWorker: 2, workerLabelsOnPr: 1, atomicRevalidated: true, uncertainRefCount: 0,
+    },
+    pairing: { policyMatched: true, activeBridgeSession: false, bridgeQuarantined: false },
+  }));
+  collect(baseEvidence({
+    journal: { phase: 'DELIVERY_UNCERTAIN', conversationId: null, confirmedTurnCount: 0, uncertainReason: 'CRASH_DURING_DISPATCHING' },
+  }));
+
+  // First conversation confirmed & continuation confirmed
+  collect(baseEvidence({ journal: { phase: 'CONFIRMED_CONVERSATION', conversationId: 'conv-1', confirmedTurnCount: 1, uncertainReason: null } }));
+  const turn2 = collect(baseEvidence({ journal: { phase: 'CONFIRMED_CONVERSATION', conversationId: 'conv-1', confirmedTurnCount: 2, uncertainReason: null } }));
+  assert.equal(turn2.confirmedTurnCount, 2);
+  assert.equal(turn2.realBrowserAcceptance, 'NOT_RUN');
+
+  for (const required of F2_REQUIRED_VISIBLE_STATES) {
+    assert.ok(observedTags.has(required), `Missing F2 visible state tag: ${required}`);
+  }
 });

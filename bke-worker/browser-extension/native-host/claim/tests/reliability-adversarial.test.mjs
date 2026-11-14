@@ -16,6 +16,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { webcrypto } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { chmod, mkdtemp, readFile, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,7 +28,9 @@ import {
   createControllerBridgeSupervisor,
 } from '../../../dist/controller-transport.js';
 import { ExtensionBrowserAdapter } from '../../../dist/extension-browser-adapter.js';
+import { DesktopControllerDaemon } from '../dist/native-host/claim/controller-daemon.js';
 import { DesktopController, FileExecutionJournal } from '../dist/native-host/claim/desktop-controller.js';
+import { ExecutionRequestVerifier, signExecutionRequestHmac } from '../dist/native-host/claim/github-app-harness.js';
 import { GitHubF1Ledger } from '../dist/native-host/claim/github-f1-ledger.js';
 import { IpcBridgeClient } from '../dist/native-host/claim/ipc-client.js';
 
@@ -677,6 +680,307 @@ test('Reliability Group 5: ChatGPT browser failures (AUTH_REQUIRED, missing comp
     assert.equal(browserStall.submits, 1);
     assert.ok(ghStall.refs.has(`refs/bke/uncertain/${PR}/attempt-rel-1`));
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('F2-05 Group 6: Parallel verifiers, parallel daemons on same journal, key rotation, clock-skew bounds, lockfile symlink, and RESERVED/FENCED recovery', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bke-f2-adv-'));
+  await chmod(dir, 0o700);
+  const BASE = Date.parse('2026-10-20T12:00:00.000Z');
+  const REPO_ID = 1354026486;
+  const INSTALL_ID = '987654321';
+  const SECRET_K1 = 'signing-secret-k1-rotation-material-32b';
+  const SECRET_K2 = 'signing-secret-k2-rotation-material-32b';
+
+  const makeMockAuthProvider = (attemptId) => ({
+    async verifyInstallationScope() {
+      return { ok: true, scope: { installationId: INSTALL_ID, repositoryId: REPO_ID, repositoryFullName: REPO, permissions: { contents: 'write', pull_requests: 'read', checks: 'read' } } };
+    },
+    async readPullRequest() {
+      return { number: PR, state: 'open', headSha: HEAD, workerLabels: [WORKER] };
+    },
+    async enumerateOpenAssignedPullRequests() {
+      return [{ number: PR, state: 'open', headSha: HEAD, workerLabels: [WORKER] }];
+    },
+    async readBkeRefState() {
+      return { consumedAttempts: [], uncertainAttempts: [], conversationTipSha: null };
+    },
+    async readPinnedTicket() {
+      return { ok: true, ticket: { contractVersion: 1, checkRunId: 5, ticketId: 'c:5', attemptId, workerId: WORKER, expiresAtMs: BASE + 120_000, headSha: HEAD } };
+    },
+  });
+
+  const makeEnv = (overrides = {}) => ({
+    protocol_version: 1,
+    repository_owner: 'jan2xo',
+    repository_name: 'bke-worker',
+    repository_id: REPO_ID,
+    installation_identity: INSTALL_ID,
+    worker_id: WORKER,
+    pr_number: PR,
+    head_sha: HEAD,
+    attempt_id: 'attempt-rel-1',
+    delivery_id: 'deliv-rel-0001',
+    action: 'DISPATCH_FIRST_MESSAGE',
+    issued_at: new Date(BASE - 1_000).toISOString(),
+    expires_at: new Date(BASE + 60_000).toISOString(),
+    authorized_capability: 'GITHUB_F1_EXECUTION_V1',
+    ...overrides,
+  });
+
+  try {
+    // 1. Parallel ExecutionRequestVerifier instances sharing same persistent FileExecutionJournal -> at most 1 wins
+    const jRacePath = join(dir, 'race-verifier.json');
+    const jA = new FileExecutionJournal(jRacePath, { repository: REPO, prNumber: PR, workerId: WORKER });
+    const jB = new FileExecutionJournal(jRacePath, { repository: REPO, prNumber: PR, workerId: WORKER });
+    await jA.openAndRecover();
+    await jB.openAndRecover();
+    const verifierCfg = {
+      expectedRepositoryOwner: 'jan2xo',
+      expectedRepositoryName: 'bke-worker',
+      expectedRepositoryId: REPO_ID,
+      expectedInstallationId: INSTALL_ID,
+      expectedWorkerId: WORKER,
+      pinnedApp: PINNED_APP,
+      hmacKeysById: new Map([['k1', SECRET_K1], ['k2', SECRET_K2]]),
+      provider: makeMockAuthProvider('attempt-rel-1'),
+      nowMs: () => BASE,
+    };
+    const vA = new ExecutionRequestVerifier({ ...verifierCfg, replayStore: jA.asPersistentReplayStore() });
+    const vB = new ExecutionRequestVerifier({ ...verifierCfg, replayStore: jB.asPersistentReplayStore() });
+    const race1 = signExecutionRequestHmac(makeEnv({ delivery_id: 'deliv-race-1' }), SECRET_K1, 'k1');
+    const race2 = signExecutionRequestHmac(makeEnv({ delivery_id: 'deliv-race-2' }), SECRET_K1, 'k1');
+    const [rA, rB] = await Promise.all([vA.verifyAndAuthorize(race1), vB.verifyAndAuthorize(race2)]);
+    const successes = [rA, rB].filter((x) => x.ok);
+    assert.equal(successes.length, 1, 'Parallel verifiers on shared journal MUST permit at most 1 reservation');
+
+    // 2. Clock skew boundary (+4s valid vs +6s NOT_YET_VALID) & key rotation across k1 -> k2
+    const jSkewPath = join(dir, 'skew-rot.json');
+    const jSkew = new FileExecutionJournal(jSkewPath, { repository: REPO, prNumber: PR, workerId: WORKER });
+    await jSkew.openAndRecover();
+    const vSkew = new ExecutionRequestVerifier({
+      ...verifierCfg,
+      provider: makeMockAuthProvider('attempt-skew-1'),
+      replayStore: jSkew.asPersistentReplayStore(),
+    });
+    const tooEarly = signExecutionRequestHmac(
+      makeEnv({ attempt_id: 'attempt-skew-1', delivery_id: 'deliv-skew-bad', issued_at: new Date(BASE + 6_000).toISOString(), expires_at: new Date(BASE + 66_000).toISOString() }),
+      SECRET_K1,
+      'k1',
+    );
+    assert.equal((await vSkew.verifyAndAuthorize(tooEarly)).code, 'EXEC_REQ_NOT_YET_VALID');
+
+    const withinSkewK1 = signExecutionRequestHmac(
+      makeEnv({ attempt_id: 'attempt-skew-1', delivery_id: 'deliv-skew-ok', issued_at: new Date(BASE + 4_000).toISOString(), expires_at: new Date(BASE + 64_000).toISOString() }),
+      SECRET_K1,
+      'k1',
+    );
+    assert.equal((await vSkew.verifyAndAuthorize(withinSkewK1)).ok, true);
+
+    // Key rotation to k2: replaying same delivery_id under new key k2 MUST still reject!
+    const replayUnderK2 = signExecutionRequestHmac(
+      makeEnv({ attempt_id: 'attempt-other-1', delivery_id: 'deliv-skew-ok', issued_at: new Date(BASE).toISOString(), expires_at: new Date(BASE + 60_000).toISOString() }),
+      SECRET_K2,
+      'k2',
+    );
+    assert.equal((await vSkew.verifyAndAuthorize(replayUnderK2)).code, 'EXEC_REQ_DELIVERY_REPLAY');
+
+    // Reset phase to IDLE via openAndRecover (pre-dispatch recovery) while burned attempt stays blocked; fresh k2 attempt succeeds
+    const recSkew = await new FileExecutionJournal(jSkewPath, { repository: REPO, prNumber: PR, workerId: WORKER }).openAndRecover();
+    assert.equal(recSkew.phase, 'IDLE');
+    assert.ok(recSkew.reservedAttempts.includes('attempt-skew-1'));
+    const jSkew2 = new FileExecutionJournal(jSkewPath, { repository: REPO, prNumber: PR, workerId: WORKER });
+    await jSkew2.openAndRecover();
+    const vRotated = new ExecutionRequestVerifier({
+      ...verifierCfg,
+      provider: makeMockAuthProvider('attempt-rot-2'),
+      replayStore: jSkew2.asPersistentReplayStore(),
+    });
+    const sameAttemptDiffKey = signExecutionRequestHmac(
+      makeEnv({ attempt_id: 'attempt-skew-1', delivery_id: 'deliv-rot-2' }),
+      SECRET_K2,
+      'k2',
+    );
+    assert.equal((await vRotated.verifyAndAuthorize(sameAttemptDiffKey)).code, 'EXEC_REQ_ATTEMPT_REPLAY');
+    const freshK2 = signExecutionRequestHmac(
+      makeEnv({ attempt_id: 'attempt-rot-2', delivery_id: 'deliv-rot-3' }),
+      SECRET_K2,
+      'k2',
+    );
+    assert.equal((await vRotated.verifyAndAuthorize(freshK2)).ok, true);
+
+    // 3. FENCED recovery preserves confirmed conversation while burning interrupted attempt
+    const jFencedPath = join(dir, 'fenced.json');
+    await writeFile(
+      jFencedPath,
+      JSON.stringify({
+        version: 1, repository: REPO, prNumber: PR, workerId: WORKER,
+        phase: 'FENCED', activeAttemptId: 'attempt-fenced-1', conversationId: 'conv-prev-1',
+        confirmedTurnCount: 1, processedAttempts: ['attempt-0'], processedDeliveries: ['d-0'],
+        reservedAttempts: [], uncertainReason: null, updatedAt: new Date(BASE).toISOString(),
+      }),
+      { mode: 0o600 },
+    );
+    const recFenced = await new FileExecutionJournal(jFencedPath, { repository: REPO, prNumber: PR, workerId: WORKER }).openAndRecover();
+    assert.equal(recFenced.phase, 'CONFIRMED_CONVERSATION');
+    assert.equal(recFenced.conversationId, 'conv-prev-1');
+    assert.ok(recFenced.reservedAttempts.includes('attempt-fenced-1'));
+
+    // 4. Symlinked journal lockfile MUST fail closed with JOURNAL_LOCK_SYMLINK_FORBIDDEN
+    const jLockPath = join(dir, 'locksym.json');
+    const jLock = new FileExecutionJournal(jLockPath, { repository: REPO, prNumber: PR, workerId: WORKER });
+    await jLock.openAndRecover();
+    const decoy = join(dir, 'decoy.txt');
+    await writeFile(decoy, 'do-not-overwrite', { mode: 0o600 });
+    await symlink(decoy, `${jLockPath}.lock`);
+    await assert.rejects(() => jLock.recordDelivery('d-blocked'), /JOURNAL_LOCK_SYMLINK_FORBIDDEN/);
+    assert.equal(await readFile(decoy, 'utf8'), 'do-not-overwrite');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('F2-05 / F2-07 Group 7: Parallel DesktopControllerDaemon HTTP race + humanLiveSendAuthorized=false envelope safety', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bke-f2-daemon-race-'));
+  await chmod(dir, 0o700);
+  const journalPath = join(dir, 'shared-journal.json');
+  const sockPath = join(dir, 'unused.sock');
+  const REPO_ID = 1354026486;
+  const INSTALL_ID = '987654321';
+  const EXEC_SECRET = 'parallel-daemon-exec-secret-material-64b';
+  const BASE = Date.parse('2026-10-20T12:00:00.000Z');
+  const TREE_LOCAL = TREE;
+  const refs = new Map();
+  let submissions = 0;
+
+  const ghServer = createServer((req, res) => {
+    const u = new URL(req.url, 'http://127.0.0.1');
+    const send = (status, data) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+    };
+    if (req.method === 'GET' && u.pathname === '/installation/repositories') {
+      return send(200, { repositories: [{ id: REPO_ID, full_name: REPO, permissions: { contents: 'write', pull_requests: 'read', checks: 'read', push: true } }] });
+    }
+    if (req.method === 'GET' && u.pathname === `/repos/${REPO}/pulls`) {
+      return send(200, [{ number: PR, state: 'open', head: { sha: HEAD }, labels: [{ name: `bke-worker:${WORKER}` }] }]);
+    }
+    if (req.method === 'GET' && u.pathname === `/repos/${REPO}/pulls/${PR}`) {
+      return send(200, { number: PR, state: 'open', head: { sha: HEAD }, labels: [{ name: `bke-worker:${WORKER}` }] });
+    }
+    if (req.method === 'GET' && u.pathname === `/repos/${REPO}/git/matching-refs/bke/`) {
+      return send(200, [...refs.entries()].map(([ref, sha]) => ({ ref, object: { sha } })));
+    }
+    if (req.method === 'GET' && u.pathname === `/repos/${REPO}/commits/${HEAD}/check-runs`) {
+      return send(200, {
+        total_count: 1,
+        check_runs: [{
+          id: 77, name: 'bke-ticket', app: PINNED_APP, head_sha: HEAD, status: 'completed', conclusion: 'success',
+          external_id: `bke-ticket:v1:${WORKER}:attempt-race-1:${Math.floor((BASE + 120_000) / 1000)}`,
+        }],
+      });
+    }
+    if (req.method === 'GET' && u.pathname.startsWith(`/repos/${REPO}/git/commits/`)) {
+      return send(200, { sha: HEAD, tree: { sha: TREE_LOCAL }, parents: [], message: 'head' });
+    }
+    return send(404, { message: 'Not Found' });
+  });
+  await new Promise((r) => ghServer.listen(0, '127.0.0.1', r));
+  const ghUrl = `http://127.0.0.1:${ghServer.address().port}`;
+
+  const makeDaemon = (idSuffix, humanLiveSendAuthorized = false) =>
+    new DesktopControllerDaemon(
+      {
+        repository: REPO,
+        prNumber: PR,
+        workerId: WORKER,
+        pinnedApp: PINNED_APP,
+        executionId: `exec-race-${idSuffix}`,
+        targetId: 'target-rel-01',
+        profileId: 'profile-rel-01',
+        targetTabId: 11,
+        journalPath,
+        ipcSocketPath: sockPath,
+        executionEnvelopeEnabled: true,
+        expectedRepositoryId: REPO_ID,
+        expectedInstallationId: INSTALL_ID,
+        executionSigningKeysById: new Map([['k1', EXEC_SECRET]]),
+        githubApiBaseUrl: ghUrl,
+        listenHost: '127.0.0.1',
+        listenPort: 0,
+        humanLiveSendAuthorized,
+        liveProofs: { githubCasOwnerCertified: false, nativePairingOwnerCertified: false, realBrowserOwnerAccepted: false },
+      },
+      {
+        tokenProvider: async () => 'ghs_local_test_token',
+        fetchImpl: (url, init) =>
+          globalThis.fetch(url.replace('https://api.github.com', ghUrl), init).then((r) => ({ status: r.status, headers: r.headers, json: () => r.json() })),
+        nowIso: () => new Date(BASE).toISOString(),
+        nowMs: () => BASE,
+      },
+    );
+
+  const d1 = makeDaemon('1', false);
+  const d2 = makeDaemon('2', false);
+
+  try {
+    const [{ port: p1 }, { port: p2 }] = await Promise.all([d1.start(), d2.start()]);
+    const makeSigned = (deliveryId, action = 'DISPATCH_FIRST_MESSAGE') =>
+      signExecutionRequestHmac(
+        {
+          protocol_version: 1,
+          repository_owner: 'jan2xo',
+          repository_name: 'bke-worker',
+          repository_id: REPO_ID,
+          installation_identity: INSTALL_ID,
+          worker_id: WORKER,
+          pr_number: PR,
+          head_sha: HEAD,
+          attempt_id: 'attempt-race-1',
+          delivery_id: deliveryId,
+          action,
+          issued_at: new Date(BASE - 1_000).toISOString(),
+          expires_at: new Date(BASE + 60_000).toISOString(),
+          authorized_capability: 'GITHUB_F1_EXECUTION_V1',
+        },
+        EXEC_SECRET,
+        'k1',
+      );
+
+    // Default-safe PREPARE succeeds (200) without sending to browser
+    const prep = await globalThis.fetch(`http://127.0.0.1:${p1}/execution-requests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(makeSigned('deliv-prep-race', 'PREPARE')),
+    });
+    assert.equal(prep.status, 200);
+    assert.equal((await prep.json()).status, 'PREPARED');
+
+    // Race two parallel daemons sharing the same disk journalPath -> at most 1 reserves & LIVE_SEND_DISABLED blocks with 0 submits
+    const [res1, res2] = await Promise.all([
+      globalThis.fetch(`http://127.0.0.1:${p1}/execution-requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(makeSigned('deliv-daemon-race-a')),
+      }),
+      globalThis.fetch(`http://127.0.0.1:${p2}/execution-requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(makeSigned('deliv-daemon-race-b')),
+      }),
+    ]);
+    const bodies = [await res1.json(), await res2.json()];
+    assert.equal(bodies.every((b) => b.status === 'BLOCKED' && b.submitInvocations === 0), true);
+    const liveDisabledCount = bodies.filter((b) => b.code === 'LIVE_SEND_DISABLED').length;
+    const replayRejectedCount = bodies.filter((b) => b.code === 'EXEC_REQ_ATTEMPT_REPLAY' || b.code === 'EXEC_REQ_CONTROLLER_CONCURRENT_RESERVATION').length;
+    assert.equal(liveDisabledCount, 1, 'Exactly one parallel daemon wins reservation');
+    assert.equal(replayRejectedCount, 1, 'Competing parallel daemon fails closed on durable reservation');
+    assert.equal(submissions, 0);
+  } finally {
+    await d1.stop();
+    await d2.stop();
+    await ghServer.close();
     await rm(dir, { recursive: true, force: true });
   }
 });

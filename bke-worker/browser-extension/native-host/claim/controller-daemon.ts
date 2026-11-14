@@ -25,9 +25,19 @@ import {
   type ControllerWakeOutcome,
   type ExecutionJournalState,
 } from './desktop-controller.js';
+import {
+  ExecutionRequestVerifier,
+  type GitHubAuthorityProvider,
+} from './github-app-harness.js';
+import { RestGitHubAuthorityProvider } from './github-authority-provider.js';
 import { GitHubF1Ledger, type LedgerHttpFetch } from './github-f1-ledger.js';
 import { IpcBridgeClient, assertSafeIpcSocketPath } from './ipc-client.js';
 import type { TokenProvider } from './send-once-claim-adapter.js';
+import {
+  StaticUnrenewableTokenProvider,
+  type ScopedTokenLifecycleProvider,
+  type TokenLifecycleStatus,
+} from './token-lifecycle.js';
 
 const MAX_HTTP_BODY_BYTES = 262_144;
 const SHA40_RE = /^[a-f0-9]{40}$/;
@@ -53,15 +63,28 @@ export interface ControllerRuntimeConfig {
   listenPort?: number;
   humanLiveSendAuthorized: boolean;
   liveProofs: FirstMessageLiveProofs;
+  // F2-02: Default-OFF signed execution envelope configuration
+  executionEnvelopeEnabled?: boolean;
+  expectedRepositoryId?: number;
+  expectedInstallationId?: string;
+  executionSigningKeysById?: ReadonlyMap<string, string>;
+  remoteHaltSigningKeysById?: ReadonlyMap<string, string>;
+  allowRemoteSignedHalt?: boolean;
+  githubApiBaseUrl?: string;
 }
 
 export interface ControllerDaemonDeps {
   tokenProvider: TokenProvider;
+  tokenLifecycle?: ScopedTokenLifecycleProvider;
+  authorityProvider?: GitHubAuthorityProvider;
   fetchImpl?: LedgerHttpFetch;
   ipcClient?: IpcBridgeClient;
   nowIso?: () => string;
   nowMs?: () => number;
+  initialBridgeSeq?: number;
 }
+
+let monotonicDaemonBootOffset = 0;
 
 export interface WebhookWakeExtraction {
   ok: true;
@@ -129,6 +152,46 @@ function constantTimeTokenMatch(expected: string, provided: string | undefined):
   return timingSafeEqual(a, b);
 }
 
+function isLoopbackRemoteAddress(addr: string | undefined): boolean {
+  if (!addr) return true;
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+function mapVerifierRejectionHttpStatus(code: string): number {
+  if (
+    code === 'EXEC_REQ_SIGNATURE_INVALID' ||
+    code === 'EXEC_REQ_SIGNING_KEY_UNKNOWN' ||
+    code === 'EXEC_REQ_HALT_KEY_UNAUTHORIZED' ||
+    code === 'GITHUB_AUTH_UNAUTHORIZED'
+  ) {
+    return 401;
+  }
+  if (
+    code === 'EXEC_REQ_TARGET_REPOSITORY_MISMATCH' ||
+    code === 'EXEC_REQ_INSTALLATION_MISMATCH' ||
+    code === 'EXEC_REQ_WORKER_MISMATCH' ||
+    code === 'EXEC_REQ_REMOTE_HALT_DISABLED' ||
+    code === 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' ||
+    code === 'GITHUB_PERMISSION_FORBIDDEN'
+  ) {
+    return 403;
+  }
+  if (
+    code.startsWith('EXEC_REQ_WRAPPER') ||
+    code.startsWith('EXEC_REQ_SIGNATURE_ENVELOPE') ||
+    code === 'EXEC_REQ_NOT_OBJECT' ||
+    code === 'EXEC_REQ_SCHEMA_MISMATCH' ||
+    code === 'EXEC_REQ_UNSUPPORTED_VERSION' ||
+    code === 'EXEC_REQ_CAPABILITY_INVALID' ||
+    code === 'EXEC_REQ_ACTION_FORBIDDEN' ||
+    code === 'EXEC_REQ_TIMESTAMPS_INVALID' ||
+    code === 'EXEC_REQ_TTL_WINDOW_INVALID'
+  ) {
+    return 400;
+  }
+  return 409;
+}
+
 function sendJson(res: ServerResponse, status: number, body: Record<string, unknown>): void {
   const encoded = JSON.stringify(body) + '\n';
   res.writeHead(status, {
@@ -160,6 +223,9 @@ export class DesktopControllerDaemon {
   private readonly journal: FileExecutionJournal;
   private readonly controller: DesktopController;
   private readonly ipcClient: IpcBridgeClient;
+  private readonly tokenLifecycle: ScopedTokenLifecycleProvider;
+  private readonly authorityProvider: GitHubAuthorityProvider;
+  private readonly executionVerifier: ExecutionRequestVerifier | null = null;
   private server: Server | null = null;
   private actualPort: number | null = null;
   private bridgeSeq = 0;
@@ -170,6 +236,9 @@ export class DesktopControllerDaemon {
     private readonly config: ControllerRuntimeConfig,
     private readonly deps: ControllerDaemonDeps,
   ) {
+    const wallSeed = Math.max(0, (Date.now() - 1_700_000_000_000) * 100);
+    monotonicDaemonBootOffset = Math.max(monotonicDaemonBootOffset + 1_000, wallSeed);
+    this.bridgeSeq = deps.initialBridgeSeq ?? monotonicDaemonBootOffset;
     if (
       !REPO_RE.test(config.repository) ||
       !Number.isSafeInteger(config.prNumber) ||
@@ -190,8 +259,32 @@ export class DesktopControllerDaemon {
       throw Error('DAEMON_NON_LOOPBACK_FORBIDDEN');
     }
 
+    // Strict key separation: execution-envelope signing secrets MUST NOT reuse webhookSecret or operatorHaltToken.
+    if (config.executionSigningKeysById) {
+      for (const secret of config.executionSigningKeysById.values()) {
+        if (config.webhookSecret && constantTimeTokenMatch(config.webhookSecret, secret)) {
+          throw Error('DAEMON_EXECUTION_WEBHOOK_KEY_REUSE_FORBIDDEN');
+        }
+        if (config.operatorHaltToken && constantTimeTokenMatch(config.operatorHaltToken, secret)) {
+          throw Error('DAEMON_EXECUTION_HALT_KEY_REUSE_FORBIDDEN');
+        }
+      }
+    }
+    if (config.remoteHaltSigningKeysById && config.executionSigningKeysById) {
+      for (const haltSecret of config.remoteHaltSigningKeysById.values()) {
+        for (const execSecret of config.executionSigningKeysById.values()) {
+          if (constantTimeTokenMatch(execSecret, haltSecret)) {
+            throw Error('DAEMON_HALT_KEY_SEPARATION_FORBIDDEN');
+          }
+        }
+      }
+    }
+
     const nowIso = deps.nowIso ?? (() => new Date().toISOString());
     const nowMs = deps.nowMs ?? (() => Date.now());
+    this.tokenLifecycle =
+      deps.tokenLifecycle ?? new StaticUnrenewableTokenProvider(deps.tokenProvider);
+
     this.ipcClient =
       deps.ipcClient ??
       new IpcBridgeClient({
@@ -208,6 +301,13 @@ export class DesktopControllerDaemon {
           headers: r.headers,
           json: () => r.json(),
         })));
+
+    this.authorityProvider =
+      deps.authorityProvider ??
+      new RestGitHubAuthorityProvider(fetchImpl, this.tokenLifecycle.asTokenProvider(), {
+        baseApiUrl: config.githubApiBaseUrl,
+        nowMs,
+      });
 
     this.journal = new FileExecutionJournal(
       config.journalPath,
@@ -240,7 +340,7 @@ export class DesktopControllerDaemon {
             nowIso,
           },
           fetchImpl,
-          deps.tokenProvider,
+          this.tokenLifecycle.asTokenProvider(),
         ),
       createBrowserPorts: (headSha) => {
         const adapter = new ExtensionBrowserAdapter(
@@ -263,6 +363,35 @@ export class DesktopControllerDaemon {
         };
       },
     });
+
+    const [owner, repoName] = config.repository.split('/');
+    if (
+      config.executionEnvelopeEnabled === true &&
+      owner &&
+      repoName &&
+      typeof config.expectedRepositoryId === 'number' &&
+      Number.isSafeInteger(config.expectedRepositoryId) &&
+      config.expectedRepositoryId > 0 &&
+      typeof config.expectedInstallationId === 'string' &&
+      config.expectedInstallationId.length > 0 &&
+      config.executionSigningKeysById &&
+      config.executionSigningKeysById.size > 0
+    ) {
+      this.executionVerifier = new ExecutionRequestVerifier({
+        expectedRepositoryOwner: owner,
+        expectedRepositoryName: repoName,
+        expectedRepositoryId: config.expectedRepositoryId,
+        expectedInstallationId: config.expectedInstallationId,
+        expectedWorkerId: config.workerId,
+        pinnedApp: config.pinnedApp,
+        hmacKeysById: config.executionSigningKeysById,
+        haltHmacKeysById: config.remoteHaltSigningKeysById,
+        allowRemoteHalt: config.allowRemoteSignedHalt === true,
+        provider: this.authorityProvider,
+        replayStore: this.journal.asPersistentReplayStore(),
+        nowMs,
+      });
+    }
   }
 
   getJournal(): ExecutionJournalState {
@@ -275,6 +404,56 @@ export class DesktopControllerDaemon {
 
   getController(): DesktopController {
     return this.controller;
+  }
+
+  getTokenLifecycleStatus(): TokenLifecycleStatus {
+    return this.tokenLifecycle.getStatus();
+  }
+
+  buildStatusSnapshot(): Record<string, unknown> {
+    const state = this.journal.current();
+    const tokenStatus = this.tokenLifecycle.getStatus();
+    const quarantined = state.phase === 'DELIVERY_UNCERTAIN' || state.phase === 'HALTED';
+    const trustedAuthorityConfigured = this.executionVerifier !== null;
+    const missingOwnerPrerequisites: string[] = [];
+
+    if (!this.config.operatorHaltToken) missingOwnerPrerequisites.push('OPERATOR_HALT_TOKEN_MISSING');
+    if (!this.config.webhookSecret && !trustedAuthorityConfigured) {
+      missingOwnerPrerequisites.push('REQUEST_AUTHENTICATION_UNCONFIGURED');
+    }
+    if (!tokenStatus.trustedRealBrokerApiAvailable || !tokenStatus.realBrokerTransportConnected) {
+      missingOwnerPrerequisites.push('REAL_TOKEN_BROKER_NOT_CONNECTED');
+    }
+    if (!this.config.humanLiveSendAuthorized) {
+      missingOwnerPrerequisites.push('HUMAN_LIVE_SEND_LOCKED_FALSE');
+    }
+    if (!this.config.liveProofs.realBrowserOwnerAccepted) {
+      missingOwnerPrerequisites.push('REAL_CHROME_ACCEPTANCE_NOT_RUN');
+    }
+
+    return {
+      version: 2,
+      repository: state.repository,
+      prNumber: state.prNumber,
+      workerId: state.workerId,
+      expectedHeadSha: state.lastExpectedHeadSha ?? null,
+      daemonRunning: this.started && !this.stopping,
+      journalPhase: state.phase,
+      quarantined,
+      conversationId: state.conversationId,
+      confirmedTurnCount: state.confirmedTurnCount,
+      uncertainReason: state.uncertainReason,
+      nativeTransportReady: this.started && !this.stopping && !this.ipcClient.isQuarantined(),
+      ipcClientQuarantined: this.ipcClient.isQuarantined(),
+      executionEnvelopeEnabled: this.config.executionEnvelopeEnabled === true,
+      trustedAuthorityConfigured,
+      credentialProviderAvailable:
+        tokenStatus.hasCachedToken || tokenStatus.mockBrokerSupported || tokenStatus.realBrokerTransportConnected,
+      tokenLifecycle: tokenStatus,
+      humanLiveSendAuthorized: this.config.humanLiveSendAuthorized,
+      liveSendDefaults: 'LOCKED_FALSE',
+      missingOwnerPrerequisites,
+    };
   }
 
   async triggerAuthorizedWake(headSha: string): Promise<ControllerWakeOutcome> {
@@ -293,6 +472,105 @@ export class DesktopControllerDaemon {
       prNumber: this.config.prNumber,
       humanLiveSendAuthorized: this.config.humanLiveSendAuthorized,
     });
+  }
+
+  async processSignedExecutionRequest(rawRequest: unknown): Promise<{ httpStatus: number; body: Record<string, unknown> }> {
+    if (this.config.executionEnvelopeEnabled !== true) {
+      return {
+        httpStatus: 403,
+        body: { ok: false, status: 'BLOCKED', code: 'EXECUTION_ENVELOPE_DISABLED', submitInvocations: 0 },
+      };
+    }
+    if (!this.executionVerifier) {
+      return {
+        httpStatus: 503,
+        body: { ok: false, status: 'BLOCKED', code: 'EXECUTION_AUTHORITY_NOT_CONFIGURED', submitInvocations: 0 },
+      };
+    }
+    if (!this.started || this.stopping) {
+      return {
+        httpStatus: 503,
+        body: { ok: false, status: 'BLOCKED', code: 'DAEMON_NOT_RUNNING', submitInvocations: 0 },
+      };
+    }
+
+    const verified = await this.executionVerifier.verifyAndAuthorize(rawRequest);
+    if (!verified.ok) {
+      return {
+        httpStatus: mapVerifierRejectionHttpStatus(verified.code),
+        body: {
+          ok: false,
+          status: 'BLOCKED',
+          code: verified.code,
+          journalPhase: this.journal.current().phase,
+          submitInvocations: 0,
+        },
+      };
+    }
+
+    const env = verified.envelope;
+    if (env.action === 'HALT') {
+      const next = await this.halt(`REMOTE_SIGNED_HALT:${env.delivery_id}`);
+      return {
+        httpStatus: 200,
+        body: {
+          ok: true,
+          status: 'HALTED',
+          code: 'CONTROLLER_HALTED',
+          journalPhase: next.phase,
+          submitInvocations: 0,
+        },
+      };
+    }
+
+    if (env.action === 'PREPARE') {
+      const prep = await this.controller.prepareFromAuthority({
+        headSha: env.head_sha,
+        prNumber: env.pr_number,
+      });
+      return {
+        httpStatus: prep.status === 'BLOCKED' ? 409 : 200,
+        body: { ok: prep.status !== 'BLOCKED', ...prep },
+      };
+    }
+
+    // Ensure token lifecycle holds a fresh scoped token before touching claim CAS or browser
+    try {
+      await this.tokenLifecycle.getToken({ minTtlMs: 5_000 });
+    } catch (err) {
+      const state = this.journal.current();
+      if (state.phase === 'RESERVED') {
+        await this.journal.transition({
+          phase: state.conversationId ? 'CONFIRMED_CONVERSATION' : 'IDLE',
+          activeAttemptId: null,
+          activeReservation: null,
+        });
+      }
+      return {
+        httpStatus: 409,
+        body: {
+          ok: false,
+          status: 'BLOCKED',
+          code: err instanceof Error ? err.message : 'TOKEN_UNAVAILABLE',
+          journalPhase: this.journal.current().phase,
+          submitInvocations: 0,
+        },
+      };
+    }
+
+    const outcome = await this.controller.processAuthorizedWake({
+      headSha: env.head_sha,
+      prNumber: env.pr_number,
+      humanLiveSendAuthorized: this.config.humanLiveSendAuthorized,
+      expectedAction: env.action,
+      expectedAttemptId: env.attempt_id,
+      reservationAlreadyRecorded: true,
+    });
+
+    return {
+      httpStatus: outcome.status === 'BLOCKED' ? 409 : 200,
+      body: { ok: outcome.status !== 'BLOCKED', ...outcome },
+    };
   }
 
   async halt(reason = 'OWNER_OPERATOR_HALT'): Promise<ExecutionJournalState> {
@@ -328,6 +606,11 @@ export class DesktopControllerDaemon {
   }
 
   private async handleHttpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!isLoopbackRemoteAddress(req.socket?.remoteAddress)) {
+      sendJson(res, 403, { ok: false, code: 'DAEMON_NON_LOOPBACK_REMOTE_FORBIDDEN' });
+      return;
+    }
+
     const method = req.method ?? 'GET';
     const path = (req.url ?? '/').split('?')[0] ?? '/';
 
@@ -344,19 +627,7 @@ export class DesktopControllerDaemon {
     }
 
     if (method === 'GET' && path === '/status') {
-      const state = this.journal.current();
-      sendJson(res, 200, {
-        version: 1,
-        repository: state.repository,
-        prNumber: state.prNumber,
-        workerId: state.workerId,
-        journalPhase: state.phase,
-        conversationId: state.conversationId,
-        confirmedTurnCount: state.confirmedTurnCount,
-        uncertainReason: state.uncertainReason,
-        humanLiveSendAuthorized: this.config.humanLiveSendAuthorized,
-        ipcClientQuarantined: this.ipcClient.isQuarantined(),
-      });
+      sendJson(res, 200, this.buildStatusSnapshot());
       return;
     }
 
@@ -386,6 +657,30 @@ export class DesktopControllerDaemon {
       }
       const next = await this.halt(reason);
       sendJson(res, 200, { ok: true, code: 'CONTROLLER_HALTED', journalPhase: next.phase });
+      return;
+    }
+
+    if (method === 'POST' && path === '/execution-requests') {
+      if (this.config.executionEnvelopeEnabled !== true) {
+        sendJson(res, 403, { ok: false, code: 'EXECUTION_ENVELOPE_DISABLED' });
+        return;
+      }
+      let rawBody: Buffer;
+      try {
+        rawBody = await readRawBody(req);
+      } catch (err) {
+        sendJson(res, 413, { ok: false, code: err instanceof Error ? err.message : 'BODY_READ_FAILED' });
+        return;
+      }
+      let parsedBody: unknown;
+      try {
+        parsedBody = JSON.parse(rawBody.toString('utf8'));
+      } catch {
+        sendJson(res, 400, { ok: false, code: 'EXEC_REQ_JSON_INVALID' });
+        return;
+      }
+      const result = await this.processSignedExecutionRequest(parsedBody);
+      sendJson(res, result.httpStatus, result.body);
       return;
     }
 
@@ -474,6 +769,17 @@ export interface DoctorCheckResult {
   ok: boolean;
   checks: Array<{ name: string; ok: boolean; detail: string }>;
   liveSendDefaults: 'LOCKED_FALSE';
+  summary: {
+    repository: string;
+    prNumber: number | null;
+    workerId: string | null;
+    executionEnvelopeEnabled: boolean;
+    trustedAuthorityConfigured: boolean;
+    credentialProviderAvailable: boolean;
+    credentialBrokerKind: 'MOCK_BROKER' | 'REMOTE_DISABLED' | 'UNCONFIGURED';
+    humanLiveSendAuthorized: boolean;
+    missingOwnerPrerequisites: string[];
+  };
 }
 
 export async function runControllerDoctor(env: Record<string, string | undefined>): Promise<DoctorCheckResult> {
@@ -490,6 +796,13 @@ export async function runControllerDoctor(env: Record<string, string | undefined
     name: 'live_send_default_safe',
     ok: !liveAuthorizedEnv,
     detail: liveAuthorizedEnv ? 'ENV_OVERRIDE_PRESENT' : 'LOCKED_FALSE',
+  });
+
+  const envelopeEnabled = env.BKE_EXECUTION_ENVELOPE_ENABLED === 'true';
+  checks.push({
+    name: 'execution_envelope_mode',
+    ok: true,
+    detail: envelopeEnabled ? 'ENABLED' : 'DISABLED_BY_DEFAULT',
   });
 
   const journalPath = env.BKE_JOURNAL_PATH;
@@ -521,6 +834,35 @@ export async function runControllerDoctor(env: Record<string, string | undefined
     }
   }
 
+  const policyPath = env.BKE_NATIVE_POLICY_PATH;
+  if (policyPath) {
+    if (!isAbsolute(policyPath)) {
+      checks.push({ name: 'native_policy_file', ok: false, detail: 'NON_ABSOLUTE_PATH' });
+    } else {
+      try {
+        const handle = await open(policyPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          const st = await handle.stat();
+          const safe = st.isFile() && (st.mode & 0o077) === 0;
+          checks.push({
+            name: 'native_policy_file',
+            ok: safe,
+            detail: safe ? 'MODE_0600_OK' : `UNSAFE_MODE_${(st.mode & 0o777).toString(8)}`,
+          });
+        } finally {
+          await handle.close();
+        }
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        checks.push({
+          name: 'native_policy_file',
+          ok: false,
+          detail: code === 'ENOENT' ? 'MISSING' : code === 'ELOOP' ? 'SYMLINK_FORBIDDEN' : 'UNREADABLE',
+        });
+      }
+    }
+  }
+
   const socketPath = env.BKE_CONTROLLER_IPC_SOCKET;
   if (socketPath) {
     try {
@@ -536,10 +878,35 @@ export async function runControllerDoctor(env: Record<string, string | undefined
     }
   }
 
+  const hasExecKey = Boolean(env.BKE_EXECUTION_SIGNING_KEY && env.BKE_EXECUTION_SIGNING_KEY_ID);
+  const trustedAuthorityConfigured =
+    envelopeEnabled &&
+    hasExecKey &&
+    Boolean(env.BKE_REPOSITORY_ID && Number(env.BKE_REPOSITORY_ID) > 0 && env.BKE_INSTALLATION_ID);
+  const hasStaticToken = Boolean(env.BKE_GITHUB_INSTALLATION_TOKEN && env.BKE_GITHUB_INSTALLATION_TOKEN.trim());
+  const missingOwnerPrerequisites: string[] = [];
+  if (!env.BKE_OPERATOR_HALT_TOKEN) missingOwnerPrerequisites.push('OPERATOR_HALT_TOKEN_MISSING');
+  if (!hasStaticToken) missingOwnerPrerequisites.push('REAL_TOKEN_BROKER_OR_TOKEN_MISSING');
+  if (!trustedAuthorityConfigured) missingOwnerPrerequisites.push('TRUSTED_EXECUTION_AUTHORITY_NOT_CONFIGURED');
+  if (env.BKE_CERT_REAL_BROWSER !== 'true') missingOwnerPrerequisites.push('REAL_CHROME_ACCEPTANCE_NOT_RUN');
+
+  const prParsed = env.BKE_PR_NUMBER ? Number(env.BKE_PR_NUMBER) : null;
+
   return {
     ok: checks.every((c) => c.ok),
     checks,
     liveSendDefaults: 'LOCKED_FALSE',
+    summary: {
+      repository: env.BKE_REPOSITORY ?? 'jan2xo/bke-worker',
+      prNumber: prParsed && Number.isSafeInteger(prParsed) && prParsed > 0 ? prParsed : null,
+      workerId: env.BKE_WORKER_ID ?? null,
+      executionEnvelopeEnabled: envelopeEnabled,
+      trustedAuthorityConfigured,
+      credentialProviderAvailable: hasStaticToken,
+      credentialBrokerKind: hasStaticToken ? 'REMOTE_DISABLED' : 'UNCONFIGURED',
+      humanLiveSendAuthorized: liveAuthorizedEnv,
+      missingOwnerPrerequisites,
+    },
   };
 }
 
@@ -558,6 +925,15 @@ function loadConfigFromEnv(env: Record<string, string | undefined>, allowLiveSen
   const listenHost = env.BKE_CONTROLLER_HOST ?? '127.0.0.1';
   const listenPort = env.BKE_CONTROLLER_PORT ? Number(env.BKE_CONTROLLER_PORT) : 31940;
 
+  const execKeys = new Map<string, string>();
+  if (env.BKE_EXECUTION_SIGNING_KEY_ID && env.BKE_EXECUTION_SIGNING_KEY) {
+    execKeys.set(env.BKE_EXECUTION_SIGNING_KEY_ID, env.BKE_EXECUTION_SIGNING_KEY);
+  }
+  const haltKeys = new Map<string, string>();
+  if (env.BKE_REMOTE_HALT_SIGNING_KEY_ID && env.BKE_REMOTE_HALT_SIGNING_KEY) {
+    haltKeys.set(env.BKE_REMOTE_HALT_SIGNING_KEY_ID, env.BKE_REMOTE_HALT_SIGNING_KEY);
+  }
+
   return {
     repository,
     prNumber,
@@ -569,11 +945,19 @@ function loadConfigFromEnv(env: Record<string, string | undefined>, allowLiveSen
     targetTabId,
     journalPath,
     ipcSocketPath,
+    policyPath: env.BKE_NATIVE_POLICY_PATH,
     webhookSecret: env.BKE_WEBHOOK_SECRET,
     operatorHaltToken: env.BKE_OPERATOR_HALT_TOKEN,
     listenHost,
     listenPort,
     humanLiveSendAuthorized: allowLiveSend,
+    executionEnvelopeEnabled: env.BKE_EXECUTION_ENVELOPE_ENABLED === 'true',
+    expectedRepositoryId: env.BKE_REPOSITORY_ID ? Number(env.BKE_REPOSITORY_ID) : undefined,
+    expectedInstallationId: env.BKE_INSTALLATION_ID,
+    executionSigningKeysById: execKeys.size > 0 ? execKeys : undefined,
+    remoteHaltSigningKeysById: haltKeys.size > 0 ? haltKeys : undefined,
+    allowRemoteSignedHalt: env.BKE_ALLOW_REMOTE_SIGNED_HALT === 'true',
+    githubApiBaseUrl: env.BKE_GITHUB_API_BASE_URL,
     liveProofs: {
       githubCasOwnerCertified: env.BKE_CERT_GITHUB_CAS === 'true',
       nativePairingOwnerCertified: env.BKE_CERT_NATIVE_PAIRING === 'true',
@@ -621,10 +1005,14 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
         repository: state.repository,
         prNumber: state.prNumber,
         workerId: state.workerId,
+        expectedHeadSha: state.lastExpectedHeadSha ?? null,
         phase: state.phase,
+        quarantined: state.phase === 'DELIVERY_UNCERTAIN' || state.phase === 'HALTED',
         confirmedTurnCount: state.confirmedTurnCount,
         conversationId: state.conversationId,
         uncertainReason: state.uncertainReason,
+        executionEnvelopeEnabled: cfg.executionEnvelopeEnabled === true,
+        humanLiveSendAuthorized: false,
       }, null, 2) + '\n',
     );
     return 0;
@@ -639,7 +1027,12 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
       workerId: cfg.workerId,
     });
     await journal.openAndRecover();
-    const halted = await journal.transition({ phase: 'HALTED', uncertainReason: reason });
+    const halted = await journal.transition({
+      phase: 'HALTED',
+      activeAttemptId: null,
+      activeReservation: null,
+      uncertainReason: reason,
+    });
     if (cfg.ipcSocketPath) {
       const client = new IpcBridgeClient({ socketPath: cfg.ipcSocketPath });
       await client.halt(reason).catch(() => undefined);
@@ -665,6 +1058,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
         mode: dryRun ? 'DRY_RUN' : 'DAEMON_LISTENING',
         port: started.port,
         phase: started.recoveredState.phase,
+        executionEnvelopeEnabled: cfg.executionEnvelopeEnabled === true,
         humanLiveSendAuthorized: cfg.humanLiveSendAuthorized,
       }) + '\n',
     );

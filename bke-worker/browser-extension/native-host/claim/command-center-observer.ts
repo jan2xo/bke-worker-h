@@ -87,10 +87,31 @@ export const COMMAND_CENTER_COMPATIBILITY_MATRIX: readonly CommandCenterMappingR
   },
 ] as const;
 
+export const F2_REQUIRED_VISIBLE_STATES = [
+  'WORKER_IDENTITY_VERIFIED',
+  'WORKER_IDENTITY_UNKNOWN',
+  'PR_ASSIGNMENT_VALID',
+  'PR_OWNERSHIP_CONFLICT',
+  'CURRENT_EXACT_SHA',
+  'STALE_SHA',
+  'CLAIM_RESERVED',
+  'EXECUTION_BLOCKED',
+  'DELIVERY_UNCERTAIN',
+  'FIRST_CONVERSATION_CONFIRMED',
+  'CONTINUATION_CONFIRMED',
+  'EXACT_HEAD_CI_PENDING_OR_FAILED',
+  'EVIDENCE_INCOMPLETE',
+  'WORKER_LIVENESS_UNKNOWN',
+] as const;
+
+export type F2VisibleStateTag = (typeof F2_REQUIRED_VISIBLE_STATES)[number];
+
 export interface RawWorkerObserverEvidence {
   observedAtMs: number;
   nowMs: number;
   maxStaleMs?: number;
+  expectedHeadSha?: string;
+  claimReserved?: boolean;
   githubAssignment?: {
     repository: string;
     prNumber: number;
@@ -100,6 +121,18 @@ export interface RawWorkerObserverEvidence {
     workerLabelsOnPr: number;
     atomicRevalidated: boolean;
     uncertainRefCount: number;
+  };
+  exactHeadCi?: {
+    status: 'PASS' | 'PENDING' | 'FAILED' | 'UNKNOWN';
+  };
+  tokenLifecycle?: {
+    valid: boolean;
+    brokerConnected: boolean;
+    expired?: boolean;
+    revoked?: boolean;
+  };
+  workerHeartbeat?: {
+    fresh: boolean;
   };
   journal?: {
     phase: JournalPhase;
@@ -127,11 +160,17 @@ export interface RawWorkerObserverEvidence {
 
 export interface CommandCenterWorkerProjection {
   schemaVersion: 1;
+  identityState: 'VERIFIED' | 'UNKNOWN';
   assignmentState: 'UNKNOWN' | 'ASSIGNED_EXCLUSIVE' | 'CONFLICT_BLOCKED';
   inventoryConsistency: 'ATOMIC_REVALIDATED' | 'NON_ATOMIC_STALE_SNAPSHOT' | 'UNKNOWN';
+  shaState: 'CURRENT_EXACT' | 'STALE' | 'UNKNOWN';
+  claimState: 'NONE' | 'RESERVED' | 'UNKNOWN';
+  exactHeadCiState: 'PASS' | 'PENDING' | 'FAILED' | 'UNKNOWN';
   pairingState: 'UNKNOWN' | 'PAIRED_IDLE_ONLY' | 'BRIDGE_ESTABLISHED' | 'QUARANTINED';
+  workerLiveness: 'ALIVE' | 'IDLE_PAIRED' | 'HALTED' | 'UNKNOWN';
   chatgptAuthState: 'UNKNOWN' | 'AUTH_REQUIRED' | 'READY' | 'BUSY' | 'AMBIGUOUS_TABS';
   dispatchReady: boolean;
+  evidenceIncomplete: boolean;
   executionState:
     | 'UNKNOWN'
     | 'IDLE_BLOCKED'
@@ -143,6 +182,7 @@ export interface CommandCenterWorkerProjection {
   conversationId: string | null;
   confirmedTurnCount: number;
   realBrowserAcceptance: 'NOT_RUN' | 'OWNER_ACCEPTED';
+  visibleStates: F2VisibleStateTag[];
   blockingReasons: string[];
 }
 
@@ -151,6 +191,7 @@ export function projectWorkerStateForCommandCenter(
 ): CommandCenterWorkerProjection {
   const maxStaleMs = ev.maxStaleMs ?? 60_000;
   const reasons: string[] = [];
+  const visibleStates = new Set<F2VisibleStateTag>();
   const staleTop = !Number.isFinite(ev.observedAtMs) || !Number.isFinite(ev.nowMs) || ev.nowMs - ev.observedAtMs > maxStaleMs;
   if (staleTop) {
     reasons.push('EVIDENCE_STALE_OR_CLOCK_INVALID');
@@ -158,6 +199,7 @@ export function projectWorkerStateForCommandCenter(
 
   let assignmentState: CommandCenterWorkerProjection['assignmentState'] = 'UNKNOWN';
   let inventoryConsistency: CommandCenterWorkerProjection['inventoryConsistency'] = 'UNKNOWN';
+  let shaState: CommandCenterWorkerProjection['shaState'] = 'UNKNOWN';
   if (!staleTop && ev.githubAssignment) {
     const g = ev.githubAssignment;
     inventoryConsistency = g.atomicRevalidated ? 'ATOMIC_REVALIDATED' : 'NON_ATOMIC_STALE_SNAPSHOT';
@@ -170,30 +212,52 @@ export function projectWorkerStateForCommandCenter(
     } else if (g.openPrCountForWorker !== 1 || g.workerLabelsOnPr !== 1) {
       assignmentState = 'CONFLICT_BLOCKED';
       reasons.push('GITHUB_WORKER_EXCLUSIVITY_VIOLATED');
+      visibleStates.add('PR_OWNERSHIP_CONFLICT');
     } else {
       assignmentState = 'ASSIGNED_EXCLUSIVE';
+      visibleStates.add('PR_ASSIGNMENT_VALID');
+    }
+
+    if (ev.expectedHeadSha) {
+      if (g.headSha === ev.expectedHeadSha) {
+        shaState = 'CURRENT_EXACT';
+        visibleStates.add('CURRENT_EXACT_SHA');
+      } else {
+        shaState = 'STALE';
+        visibleStates.add('STALE_SHA');
+        reasons.push('GITHUB_HEAD_SHA_STALE');
+      }
+    } else {
+      shaState = 'CURRENT_EXACT';
+      visibleStates.add('CURRENT_EXACT_SHA');
     }
   } else {
     reasons.push('GITHUB_ASSIGNMENT_EVIDENCE_MISSING');
   }
 
   let pairingState: CommandCenterWorkerProjection['pairingState'] = 'UNKNOWN';
+  let identityState: CommandCenterWorkerProjection['identityState'] = 'UNKNOWN';
   if (!staleTop && ev.pairing) {
     if (ev.pairing.bridgeQuarantined) {
       pairingState = 'QUARANTINED';
+      identityState = ev.pairing.policyMatched ? 'VERIFIED' : 'UNKNOWN';
       reasons.push('NATIVE_BRIDGE_QUARANTINED');
     } else if (ev.pairing.policyMatched && ev.pairing.activeBridgeSession) {
       pairingState = 'BRIDGE_ESTABLISHED';
+      identityState = 'VERIFIED';
     } else if (ev.pairing.policyMatched) {
       pairingState = 'PAIRED_IDLE_ONLY';
+      identityState = 'VERIFIED';
       reasons.push('PAIRING_WITHOUT_ACTIVE_SESSION');
     } else {
       pairingState = 'UNKNOWN';
+      identityState = 'UNKNOWN';
       reasons.push('NATIVE_POLICY_UNVERIFIED');
     }
   } else {
     reasons.push('PAIRING_EVIDENCE_MISSING');
   }
+  visibleStates.add(identityState === 'VERIFIED' ? 'WORKER_IDENTITY_VERIFIED' : 'WORKER_IDENTITY_UNKNOWN');
 
   let chatgptAuthState: CommandCenterWorkerProjection['chatgptAuthState'] = 'UNKNOWN';
   if (!staleTop && ev.browser) {
@@ -220,29 +284,81 @@ export function projectWorkerStateForCommandCenter(
     reasons.push('BROWSER_EVIDENCE_MISSING');
   }
 
+  const exactHeadCiState: CommandCenterWorkerProjection['exactHeadCiState'] =
+    staleTop || !ev.exactHeadCi ? 'UNKNOWN' : ev.exactHeadCi.status;
+  if (exactHeadCiState === 'PENDING' || exactHeadCiState === 'FAILED') {
+    visibleStates.add('EXACT_HEAD_CI_PENDING_OR_FAILED');
+    reasons.push(`EXACT_HEAD_CI_${exactHeadCiState}`);
+  }
+
   const journalPhase = ev.journal?.phase ?? null;
+  const claimReserved = Boolean(!staleTop && (ev.claimReserved || journalPhase === 'RESERVED' || journalPhase === 'FENCED'));
+  const claimState: CommandCenterWorkerProjection['claimState'] =
+    staleTop || !ev.journal ? 'UNKNOWN' : claimReserved ? 'RESERVED' : 'NONE';
+  if (claimState === 'RESERVED') {
+    visibleStates.add('CLAIM_RESERVED');
+  }
+
+  if (!staleTop && ev.tokenLifecycle && !ev.tokenLifecycle.valid) {
+    reasons.push(ev.tokenLifecycle.revoked ? 'TOKEN_REVOKED' : ev.tokenLifecycle.expired ? 'TOKEN_EXPIRED' : 'TOKEN_UNAVAILABLE');
+  }
+
+  let workerLiveness: CommandCenterWorkerProjection['workerLiveness'] = 'UNKNOWN';
+  if (!staleTop && ev.journal && journalPhase === 'HALTED') {
+    workerLiveness = 'HALTED';
+  } else if (!staleTop && pairingState === 'BRIDGE_ESTABLISHED' && (ev.workerHeartbeat ? ev.workerHeartbeat.fresh : true)) {
+    workerLiveness = 'ALIVE';
+  } else if (!staleTop && pairingState === 'PAIRED_IDLE_ONLY') {
+    workerLiveness = 'IDLE_PAIRED';
+    visibleStates.add('WORKER_LIVENESS_UNKNOWN');
+    reasons.push('INACTIVE_PAIRED_WORKER_NOT_RUNNING');
+  } else {
+    workerLiveness = 'UNKNOWN';
+    visibleStates.add('WORKER_LIVENESS_UNKNOWN');
+  }
+
   let executionState: CommandCenterWorkerProjection['executionState'] = 'UNKNOWN';
   if (staleTop || !ev.journal) {
     executionState = 'UNKNOWN';
   } else if (journalPhase === 'DELIVERY_UNCERTAIN' || (ev.githubAssignment?.uncertainRefCount ?? 0) > 0) {
     executionState = 'DELIVERY_UNCERTAIN_BLOCKED';
+    visibleStates.add('DELIVERY_UNCERTAIN');
+    visibleStates.add('EXECUTION_BLOCKED');
     reasons.push(ev.journal.uncertainReason ?? 'DELIVERY_UNCERTAIN');
   } else if (journalPhase === 'HALTED') {
     executionState = 'HALTED_BLOCKED';
+    visibleStates.add('EXECUTION_BLOCKED');
     reasons.push(ev.journal.uncertainReason ?? 'CONTROLLER_HALTED');
-  } else if (assignmentState === 'CONFLICT_BLOCKED') {
+  } else if (assignmentState === 'CONFLICT_BLOCKED' || shaState === 'STALE') {
     executionState = 'CONFLICT_BLOCKED';
+    visibleStates.add('EXECUTION_BLOCKED');
   } else if (journalPhase === 'CONFIRMED_CONVERSATION') {
     executionState = 'CONFIRMED_CONVERSATION';
+    if (ev.journal.confirmedTurnCount === 1) {
+      visibleStates.add('FIRST_CONVERSATION_CONFIRMED');
+    } else if (ev.journal.confirmedTurnCount >= 2) {
+      visibleStates.add('FIRST_CONVERSATION_CONFIRMED');
+      visibleStates.add('CONTINUATION_CONFIRMED');
+    }
   } else if (
     assignmentState === 'ASSIGNED_EXCLUSIVE' &&
     inventoryConsistency === 'ATOMIC_REVALIDATED' &&
+    shaState === 'CURRENT_EXACT' &&
     pairingState === 'BRIDGE_ESTABLISHED' &&
-    chatgptAuthState === 'READY'
+    chatgptAuthState === 'READY' &&
+    (ev.exactHeadCi ? ev.exactHeadCi.status === 'PASS' : true) &&
+    (ev.tokenLifecycle ? ev.tokenLifecycle.valid : true)
   ) {
     executionState = 'READY_SUPERVISED';
   } else {
     executionState = 'IDLE_BLOCKED';
+    visibleStates.add('EXECUTION_BLOCKED');
+  }
+
+  const evidenceIncomplete =
+    staleTop || !ev.githubAssignment || !ev.journal || !ev.pairing || !ev.browser;
+  if (evidenceIncomplete) {
+    visibleStates.add('EVIDENCE_INCOMPLETE');
   }
 
   const realBrowserAcceptance: CommandCenterWorkerProjection['realBrowserAcceptance'] =
@@ -255,24 +371,38 @@ export function projectWorkerStateForCommandCenter(
     !staleTop &&
     assignmentState === 'ASSIGNED_EXCLUSIVE' &&
     inventoryConsistency === 'ATOMIC_REVALIDATED' &&
+    shaState === 'CURRENT_EXACT' &&
     pairingState === 'BRIDGE_ESTABLISHED' &&
     chatgptAuthState === 'READY' &&
+    (ev.exactHeadCi ? ev.exactHeadCi.status === 'PASS' : true) &&
+    (ev.tokenLifecycle ? ev.tokenLifecycle.valid : true) &&
     journalPhase !== 'DELIVERY_UNCERTAIN' &&
     journalPhase !== 'HALTED' &&
     journalPhase !== 'DISPATCHING' &&
     journalPhase !== 'CONTINUING';
 
+  if (!dispatchReady && executionState !== 'CONFIRMED_CONVERSATION') {
+    visibleStates.add('EXECUTION_BLOCKED');
+  }
+
   return {
     schemaVersion: 1,
+    identityState,
     assignmentState,
     inventoryConsistency,
+    shaState,
+    claimState,
+    exactHeadCiState,
     pairingState,
+    workerLiveness,
     chatgptAuthState,
     dispatchReady,
+    evidenceIncomplete,
     executionState,
     conversationId: !staleTop && ev.journal ? ev.journal.conversationId : null,
     confirmedTurnCount: !staleTop && ev.journal ? ev.journal.confirmedTurnCount : 0,
     realBrowserAcceptance,
+    visibleStates: [...visibleStates],
     blockingReasons: [...new Set(reasons)],
   };
 }

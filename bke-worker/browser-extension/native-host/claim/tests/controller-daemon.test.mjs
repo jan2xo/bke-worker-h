@@ -430,3 +430,165 @@ test('DesktopControllerDaemon connects real HTTP webhook/halt + real local GitHu
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('F2-01 / F2-02 / F2-08: Halt header contract, HTTP 409 quarantine blocking, execution-envelope default-OFF gate, key separation, and secret-free diagnostics', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bke-daemon-f2-'));
+  await chmod(dir, 0o700);
+  const sockPath = join(dir, 'bridge.sock');
+  const journalPath = join(dir, 'journal.json');
+  const execSecret = 'exec-envelope-hmac-secret-isolated-64bytes';
+
+  // Reject reusing webhookSecret for execution signing
+  assert.throws(
+    () =>
+      new DesktopControllerDaemon(
+        {
+          repository: REPO,
+          prNumber: PR_NUMBER,
+          workerId: WORKER,
+          pinnedApp: PINNED_APP,
+          executionId: 'exec-f2-01',
+          targetId: 'target-daemon-01',
+          profileId: 'profile-daemon-01',
+          targetTabId: 11,
+          journalPath,
+          ipcSocketPath: sockPath,
+          webhookSecret: WEBHOOK_SECRET,
+          operatorHaltToken: HALT_TOKEN,
+          executionEnvelopeEnabled: true,
+          expectedRepositoryId: 1354026486,
+          expectedInstallationId: '987654321',
+          executionSigningKeysById: new Map([['k1', WEBHOOK_SECRET]]),
+          humanLiveSendAuthorized: false,
+          liveProofs: { githubCasOwnerCertified: false, nativePairingOwnerCertified: false, realBrowserOwnerAccepted: false },
+        },
+        { tokenProvider: async () => 'token' },
+      ),
+    /DAEMON_EXECUTION_WEBHOOK_KEY_REUSE_FORBIDDEN/,
+  );
+
+  // Reject non-loopback listener
+  assert.throws(
+    () =>
+      new DesktopControllerDaemon(
+        {
+          repository: REPO,
+          prNumber: PR_NUMBER,
+          workerId: WORKER,
+          pinnedApp: PINNED_APP,
+          executionId: 'exec-f2-01',
+          targetId: 'target-daemon-01',
+          profileId: 'profile-daemon-01',
+          targetTabId: 11,
+          journalPath,
+          ipcSocketPath: sockPath,
+          listenHost: '0.0.0.0',
+          humanLiveSendAuthorized: false,
+          liveProofs: { githubCasOwnerCertified: false, nativePairingOwnerCertified: false, realBrowserOwnerAccepted: false },
+        },
+        { tokenProvider: async () => 'token' },
+      ),
+    /DAEMON_NON_LOOPBACK_FORBIDDEN/,
+  );
+
+  const daemon = new DesktopControllerDaemon(
+    {
+      repository: REPO,
+      prNumber: PR_NUMBER,
+      workerId: WORKER,
+      pinnedApp: PINNED_APP,
+      executionId: 'exec-f2-01',
+      targetId: 'target-daemon-01',
+      profileId: 'profile-daemon-01',
+      targetTabId: 11,
+      journalPath,
+      ipcSocketPath: sockPath,
+      webhookSecret: WEBHOOK_SECRET,
+      operatorHaltToken: HALT_TOKEN,
+      executionSigningKeysById: new Map([['k1', execSecret]]),
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      humanLiveSendAuthorized: false,
+      liveProofs: { githubCasOwnerCertified: false, nativePairingOwnerCertified: false, realBrowserOwnerAccepted: false },
+    },
+    { tokenProvider: async () => 'super-secret-ghs-token-never-print' },
+  );
+
+  try {
+    const { port } = await daemon.start();
+    const base = `http://127.0.0.1:${port}`;
+
+    // F2-02: Default-OFF POST /execution-requests fails closed with 403
+    const envDisabled = await globalThis.fetch(`${base}/execution-requests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(envDisabled.status, 403);
+    assert.equal((await envDisabled.json()).code, 'EXECUTION_ENVELOPE_DISABLED');
+
+    // F2-08: /status exposes non-secret F2 operational readiness fields & zero secrets
+    const stRes = await globalThis.fetch(`${base}/status`);
+    const st = await stRes.json();
+    assert.equal(st.executionEnvelopeEnabled, false);
+    assert.equal(st.trustedAuthorityConfigured, false);
+    assert.equal(st.humanLiveSendAuthorized, false);
+    assert.equal(st.liveSendDefaults, 'LOCKED_FALSE');
+    assert.ok(Array.isArray(st.missingOwnerPrerequisites) && st.missingOwnerPrerequisites.includes('REAL_CHROME_ACCEPTANCE_NOT_RUN'));
+    const stText = JSON.stringify(st);
+    assert.equal(stText.includes(WEBHOOK_SECRET), false);
+    assert.equal(stText.includes(HALT_TOKEN), false);
+    assert.equal(stText.includes(execSecret), false);
+    assert.equal(stText.includes('super-secret-ghs-token-never-print'), false);
+
+    // Put journal in DELIVERY_UNCERTAIN and verify webhook blocks with HTTP 409 while x-bke-halt-token still halts
+    await daemon.getController().initialize();
+    const rawJ = JSON.parse(await readFile(journalPath, 'utf8'));
+    rawJ.phase = 'DELIVERY_UNCERTAIN';
+    rawJ.uncertainReason = 'SIMULATED_QUARANTINE';
+    await writeFile(journalPath, JSON.stringify(rawJ), { mode: 0o600 });
+    await daemon.getController().initialize();
+
+    const blockedRaw = JSON.stringify({ repository: { full_name: REPO }, check_run: { head_sha: HEAD, pull_requests: [{ number: PR_NUMBER }] } });
+    const blockedRes = await globalThis.fetch(`${base}/webhooks/github`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-GitHub-Event': 'check_run',
+        'X-GitHub-Delivery': 'deliv-q-409',
+        'X-Hub-Signature-256': 'sha256=' + createHmac('sha256', WEBHOOK_SECRET).update(blockedRaw).digest('hex'),
+      },
+      body: blockedRaw,
+    });
+    assert.equal(blockedRes.status, 409);
+
+    // Bearer token & wrong x-bke-halt-token MUST be rejected (403)
+    const bearerRes = await globalThis.fetch(`${base}/halt`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${HALT_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'BAD_HEADER' }),
+    });
+    assert.equal(bearerRes.status, 403);
+
+    const wrongHalt = await globalThis.fetch(`${base}/halt`, {
+      method: 'POST',
+      headers: { 'x-bke-halt-token': 'wrong-token', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'BAD_TOKEN' }),
+    });
+    assert.equal(wrongHalt.status, 403);
+
+    // Valid x-bke-halt-token succeeds even while quarantined!
+    const validHalt = await globalThis.fetch(`${base}/halt`, {
+      method: 'POST',
+      headers: { 'x-bke-halt-token': HALT_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: 'OWNER_HALT_OVER_QUARANTINE' }),
+    });
+    assert.equal(validHalt.status, 200);
+    const validHaltBody = await validHalt.json();
+    assert.equal(validHaltBody.journalPhase, 'HALTED');
+    assert.equal(JSON.stringify(validHaltBody).includes(HALT_TOKEN), false);
+  } finally {
+    await daemon.stop();
+    await rm(dir, { recursive: true, force: true });
+  }
+});

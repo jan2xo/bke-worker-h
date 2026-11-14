@@ -23,6 +23,8 @@
     "ipc-client.ts",
     "controller-daemon.ts",
     "github-app-harness.ts",
+    "github-authority-provider.ts",
+    "token-lifecycle.ts",
     "command-center-observer.ts"
   ]
 }

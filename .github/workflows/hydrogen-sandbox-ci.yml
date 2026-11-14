@@ -36,12 +36,15 @@ jobs:
         run: |
           npm install --ignore-scripts --no-audit --no-fund --package-lock=false
           npm run check
+          npm run controller:doctor
           npm run smoke:native -- --report "$RUNNER_TEMP/desktop-native-smoke-report.json"
 
-      - name: Run certification harness in explicit sandbox dry-run mode
+      - name: Run certification harness and input-only boundary lint
         working-directory: bke-worker
         run: |
           bash scripts/certify-forge-f1-desktop-mvp.sh --sandbox --dry-run
+          node scripts/input-only-lint.mjs
+          node --test scripts/input-only-lint.test.mjs
 
       - name: Verify Cloudflare relay protocol & reconnect recovery planner
         working-directory: bke-worker/cloudflare-relay
@@ -49,10 +52,11 @@ jobs:
           npm run check
           npm run reconnect-recovery-test
 
-      - name: Verify operator, Android & security contracts
+      - name: Verify operator, Android, readiness & security contracts
         working-directory: bke-worker
         run: |
           python3 tests/forge_f1_desktop_mvp_contract.py
+          python3 tests/forge_f1_desktop_readiness_contract.py
           python3 tests/chrome_native_host_installer_contract.py
           python3 tests/operator_entrypoint_contract.py
           python3 tests/android_gecko_probe_contract.py
@@ -61,5 +65,11 @@ jobs:
           node --test tests/admin_preproduction_activation.test.mjs
           bash tests/chrome_native_host_installer_contract.sh
           bash scripts/package-desktop-worker.sh package --out "$RUNNER_TEMP/desktop-pkg"
+          node -e '
+            const fs = require("node:fs");
+            const m = JSON.parse(fs.readFileSync(process.env.RUNNER_TEMP + "/desktop-pkg/package-manifest.json", "utf8"));
+            if (m.live_send_locked_false !== true) throw new Error("live_send_locked_false must be true");
+            if (m.execution_envelope_default_disabled !== true) throw new Error("execution_envelope_default_disabled must be true");
+          '
           bash scripts/package-desktop-worker.sh verify --out "$RUNNER_TEMP/desktop-pkg"
           bash scripts/package-desktop-worker.sh clean-uninstall --out "$RUNNER_TEMP/desktop-pkg"
