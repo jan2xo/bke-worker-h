@@ -214,9 +214,10 @@ export class RestGitHubAuthorityProvider implements GitHubAuthorityProvider {
 
       let response: LedgerHttpResponse;
       try {
-        // Strictly GET-only: RestGitHubAuthorityProvider never issues mutations.
+        // Strictly GET-only with redirect: 'manual' so installation tokens never leak on 3xx redirects.
         response = await this.fetchImpl(fullUrl, {
           method: 'GET',
+          redirect: 'manual',
           signal: controller.signal,
           headers: {
             Authorization: `Bearer ${token}`,
@@ -231,6 +232,10 @@ export class RestGitHubAuthorityProvider implements GitHubAuthorityProvider {
         const detail = err instanceof Error ? sanitizeErrorText(err.message, token) : 'NETWORK_ERROR';
         void detail;
         throw Error('GITHUB_AUTHORITY_TRANSPORT_FAILED');
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        throw Error('GITHUB_REDIRECT_BLOCKED');
       }
 
       let data: unknown = null;
@@ -304,18 +309,19 @@ export class RestGitHubAuthorityProvider implements GitHubAuthorityProvider {
       return { ok: false, code: 'GITHUB_REPOSITORY_ID_MISMATCH' };
     }
 
-    const headerInstallId = undefined as string | undefined;
-    void headerInstallId;
     const permsRaw = found.permissions;
-    const perms =
-      permsRaw && typeof permsRaw === 'object' && !Array.isArray(permsRaw)
-        ? (permsRaw as Record<string, unknown>)
-        : {};
-    if (perms.pull === false) {
-      return { ok: false, code: 'GITHUB_INSTALLATION_PERMISSION_DENIED' };
+    if (!permsRaw || typeof permsRaw !== 'object' || Array.isArray(permsRaw) || Object.keys(permsRaw).length === 0) {
+      return { ok: false, code: 'GITHUB_INSTALLATION_PERMISSIONS_MISSING' };
     }
-    if (perms.admin === true) {
+    const perms = permsRaw as Record<string, unknown>;
+    if (perms.admin === true || perms.maintain === true) {
       return { ok: false, code: 'GITHUB_INSTALLATION_OVERPRIVILEGED' };
+    }
+    if (
+      perms.pull === false ||
+      (perms.pull !== true && perms.contents !== 'read' && perms.contents !== 'write')
+    ) {
+      return { ok: false, code: 'GITHUB_INSTALLATION_PERMISSION_DENIED' };
     }
 
     return {

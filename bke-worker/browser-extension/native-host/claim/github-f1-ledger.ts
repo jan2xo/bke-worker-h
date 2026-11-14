@@ -67,6 +67,7 @@ export interface GitHubF1LedgerConfig {
   targetId: string;
   profileId: string;
   targetTabId: number;
+  baseApiUrl?: string;
   timeoutMs?: number;
   nowIso?: () => string;
 }
@@ -165,7 +166,7 @@ function parseWorkerOwners(labels: unknown): string[] {
 }
 
 export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedgerPort {
-  private readonly baseApi = 'https://api.github.com';
+  private readonly baseApi: string;
   private readonly repoRoot: string;
   private readonly timeoutMs: number;
   private readonly nowIsoFn: () => string;
@@ -209,6 +210,7 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
     }
     this.timeoutMs = timeout;
     this.nowIsoFn = config.nowIso ?? (() => new Date().toISOString());
+    this.baseApi = (config.baseApiUrl ?? 'https://api.github.com').replace(/\/+$/, '');
     this.repoRoot = `${this.baseApi}/repos/${config.repository}`;
   }
 
@@ -242,6 +244,7 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
       try {
         response = await (this.fetch as LedgerHttpFetch)(fullUrl, {
           method,
+          redirect: 'manual',
           signal: controller.signal,
           headers: {
             Authorization: `Bearer ${token}`,
@@ -253,6 +256,9 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
         });
       } catch {
         throw Error('GITHUB_TRANSPORT_UNCERTAIN');
+      }
+      if (response.status >= 300 && response.status < 400) {
+        throw Error('GITHUB_REDIRECT_BLOCKED');
       }
       if (response.status === 404) {
         return {status: 404, data: null, raw: response};

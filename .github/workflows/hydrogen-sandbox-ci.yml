@@ -52,6 +52,11 @@ jobs:
           npm run check
           npm run reconnect-recovery-test
 
+      - name: Run F3 trusted desktop broker, enrollment, multi-process E2E & chaos suites
+        working-directory: bke-worker/integrations/desktop-broker
+        run: |
+          npm run check
+
       - name: Verify operator, Android, readiness & security contracts
         working-directory: bke-worker
         run: |
@@ -64,6 +69,9 @@ jobs:
           python3 tests/cloudflare_relay_contract.py
           node --test tests/admin_preproduction_activation.test.mjs
           bash tests/chrome_native_host_installer_contract.sh
+          grep -q '^BKE_EXECUTION_V2_ASYMMETRIC_ENABLED=false$' deploy/desktop-controller.env.example
+          grep -q '^BKE_REQUIRE_ASYMMETRIC_V2=false$' deploy/desktop-controller.env.example
+          grep -q '^BKE_REMOTE_BROKER_ENABLED=false$' deploy/desktop-controller.env.example
           bash scripts/package-desktop-worker.sh package --out "$RUNNER_TEMP/desktop-pkg"
           node -e '
             const fs = require("node:fs");

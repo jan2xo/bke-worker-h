@@ -74,6 +74,7 @@ export interface TokenLifecycleStatus {
   hasCachedToken: boolean;
   expiresAtMs: number | null;
   revoked: boolean;
+  lastRecoveryClassification?: 'NONE' | 'RECOVERED_TRANSIENT' | 'BLOCKED_PERMANENT';
 }
 
 export interface ScopedTokenLifecycleProvider {
@@ -93,6 +94,8 @@ export interface ManagedTokenProviderConfig {
   refreshMarginMs?: number;
   requestTimeoutMs?: number;
   minValidRemainingMs?: number;
+  maxTransientRetries?: number;
+  retryDelayMs?: number;
   trustedRealBrokerApiAvailable?: boolean;
   realBrokerTransportConnected?: boolean;
   realGitHubAppRenewalCertified?: boolean;
@@ -103,11 +106,14 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
   private readonly refreshMarginMs: number;
   private readonly requestTimeoutMs: number;
   private readonly minValidRemainingMs: number;
+  private readonly maxTransientRetries: number;
+  private readonly retryDelayMs: number;
   private readonly nowMs: () => number;
 
   private cached: IssuedScopedToken | null = null;
   private inFlightRefresh: Promise<IssuedScopedToken> | null = null;
   private revokedFlag = false;
+  private lastRecoveryClassification: 'NONE' | 'RECOVERED_TRANSIENT' | 'BLOCKED_PERMANENT' = 'NONE';
 
   constructor(
     private readonly config: ManagedTokenProviderConfig,
@@ -123,6 +129,8 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
     this.refreshMarginMs = config.refreshMarginMs ?? 60_000;
     this.requestTimeoutMs = config.requestTimeoutMs ?? 5_000;
     this.minValidRemainingMs = config.minValidRemainingMs ?? 5_000;
+    this.maxTransientRetries = Math.max(0, Math.min(3, config.maxTransientRetries ?? 0));
+    this.retryDelayMs = Math.max(0, Math.min(250, config.retryDelayMs ?? 15));
     this.nowMs = config.nowMs ?? (() => Date.now());
   }
 
@@ -150,6 +158,7 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
       hasCachedToken: valid,
       expiresAtMs: valid && this.cached ? this.cached.expiresAtMs : null,
       revoked: this.revokedFlag,
+      lastRecoveryClassification: this.lastRecoveryClassification,
     };
   }
 
@@ -226,7 +235,33 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
     });
   }
 
+  private static isRetryableCredentialError(code: string): boolean {
+    return code === 'TOKEN_BROKER_UNAVAILABLE' || code === 'TOKEN_BROKER_TIMEOUT';
+  }
+
   private async fetchAndValidateFromBroker(): Promise<IssuedScopedToken> {
+    let lastError: Error = Error('TOKEN_BROKER_UNAVAILABLE');
+    for (let attempt = 0; attempt <= this.maxTransientRetries; attempt++) {
+      try {
+        const token = await this.fetchAndValidateOnce();
+        this.lastRecoveryClassification = attempt > 0 ? 'RECOVERED_TRANSIENT' : 'NONE';
+        return token;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'TOKEN_BROKER_UNAVAILABLE';
+        lastError = err instanceof Error ? err : Error(msg);
+        if (!ManagedTokenProvider.isRetryableCredentialError(msg) || attempt === this.maxTransientRetries) {
+          this.lastRecoveryClassification = 'BLOCKED_PERMANENT';
+          throw lastError;
+        }
+        if (this.retryDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  private async fetchAndValidateOnce(): Promise<IssuedScopedToken> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -253,7 +288,6 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
           throw Error('TOKEN_BROKER_TIMEOUT');
         }
         const msg = err instanceof Error ? err.message : 'TOKEN_BROKER_UNAVAILABLE';
-        // Preserve known safe protocol codes without ever leaking token values
         const safe = sanitizeTokenErrorMessage(msg);
         if (safe.startsWith('TOKEN_') || safe.startsWith('REAL_BROKER_')) {
           throw Error(safe);

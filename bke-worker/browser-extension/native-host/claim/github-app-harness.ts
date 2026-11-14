@@ -7,11 +7,13 @@
  * and a canonically serialized, cryptographically verified 14-field execution request
  * protocol with strict replay, expiry, role-separation, and live-GitHub checks.
  */
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, createPublicKey, sign as cryptoSign, timingSafeEqual, verify as cryptoVerify } from 'node:crypto';
 import type { PinnedDispatcherApp, ValidTicket } from '../../src/ticket-contract.js';
 
 export const EXECUTION_REQUEST_PROTOCOL_VERSION = 1 as const;
 export const AUTHORIZED_CAPABILITY_V1 = 'GITHUB_F1_EXECUTION_V1' as const;
+export const EXECUTION_REQUEST_PROTOCOL_VERSION_V2 = 2 as const;
+export const AUTHORIZED_CAPABILITY_V2 = 'GITHUB_F1_EXECUTION_V2' as const;
 
 export type ExecutionAction =
   | 'PREPARE'
@@ -36,11 +38,41 @@ export interface ExecutionRequestEnvelopeV1 {
   authorized_capability: typeof AUTHORIZED_CAPABILITY_V1;
 }
 
+export interface ExecutionRequestEnvelopeV2 {
+  protocol_version: 2;
+  broker_issuer: string;
+  audience: string;
+  repository_owner: string;
+  repository_name: string;
+  repository_id: number;
+  installation_identity: string;
+  worker_id: string;
+  device_id: string;
+  enrollment_generation: number;
+  pr_number: number;
+  head_sha: string;
+  attempt_id: string;
+  delivery_id: string;
+  action: ExecutionAction;
+  issued_at: string;
+  expires_at: string;
+  authorized_capability: typeof AUTHORIZED_CAPABILITY_V2;
+}
+
+export type AnyExecutionRequestEnvelope = ExecutionRequestEnvelopeV1 | ExecutionRequestEnvelopeV2;
+
 export interface SignedExecutionRequestV1 {
   envelope: ExecutionRequestEnvelopeV1;
   signature_alg: 'HMAC-SHA256';
   key_id: string;
   signature_hex: string;
+}
+
+export interface SignedExecutionRequestV2 {
+  envelope: ExecutionRequestEnvelopeV2;
+  signature_alg: 'Ed25519';
+  key_id: string;
+  signature_b64url: string;
 }
 
 export interface GitHubInstallationScope {
@@ -101,16 +133,46 @@ const ENVELOPE_KEYS = [
   'worker_id',
 ] as const;
 
+const ENVELOPE_V2_KEYS = [
+  'action',
+  'attempt_id',
+  'audience',
+  'authorized_capability',
+  'broker_issuer',
+  'delivery_id',
+  'device_id',
+  'enrollment_generation',
+  'expires_at',
+  'head_sha',
+  'installation_identity',
+  'issued_at',
+  'pr_number',
+  'protocol_version',
+  'repository_id',
+  'repository_name',
+  'repository_owner',
+  'worker_id',
+] as const;
+
 const OWNER_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 const REPO_NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
 const INSTALL_ID_RE = /^[0-9]{1,20}$/;
 const WORKER_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const DEVICE_ID_RE = /^[A-Za-z0-9._:-]{6,128}$/;
+const ISSUER_RE = /^https?:\/\/[A-Za-z0-9._:-]{3,128}$/;
+const AUDIENCE_RE = /^bke-desktop-controller:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+:[a-z0-9][a-z0-9-]{0,62}$/;
 const SHA40_RE = /^[a-f0-9]{40}$/;
 const ATTEMPT_RE = /^[a-z0-9][a-z0-9-]{0,95}$/;
 const DELIVERY_RE = /^[A-Za-z0-9_.:-]{4,128}$/;
 const HEX64_RE = /^[a-f0-9]{64}$/;
+const B64URL_SIG_RE = /^[A-Za-z0-9_-]{86}$/;
+const V2_DOMAIN_PREFIX = 'BKE_EXECUTION_REQUEST_V2\n';
 const MAX_ENVELOPE_TTL_MS = 300_000;
 const MAX_CLOCK_SKEW_MS = 5_000;
+
+export function buildExecutionAudience(repositoryFullName: string, workerId: string): string {
+  return `bke-desktop-controller:${repositoryFullName}:${workerId}`;
+}
 
 export function serializeCanonicalExecutionEnvelope(envelope: ExecutionRequestEnvelopeV1): string {
   const ordered: Record<string, unknown> = {};
@@ -120,23 +182,15 @@ export function serializeCanonicalExecutionEnvelope(envelope: ExecutionRequestEn
   return JSON.stringify(ordered);
 }
 
-export function validateExecutionEnvelopeShape(
-  raw: unknown,
-): { ok: true; envelope: ExecutionRequestEnvelopeV1 } | { ok: false; code: string } {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ok: false, code: 'EXEC_REQ_NOT_OBJECT' };
+export function serializeCanonicalExecutionEnvelopeV2(envelope: ExecutionRequestEnvelopeV2): string {
+  const ordered: Record<string, unknown> = {};
+  for (const k of ENVELOPE_V2_KEYS) {
+    ordered[k] = envelope[k];
   }
-  const obj = raw as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  if (keys.join(',') !== ENVELOPE_KEYS.join(',')) {
-    return { ok: false, code: 'EXEC_REQ_SCHEMA_MISMATCH' };
-  }
-  if (obj.protocol_version !== EXECUTION_REQUEST_PROTOCOL_VERSION) {
-    return { ok: false, code: 'EXEC_REQ_UNSUPPORTED_VERSION' };
-  }
-  if (obj.authorized_capability !== AUTHORIZED_CAPABILITY_V1) {
-    return { ok: false, code: 'EXEC_REQ_CAPABILITY_INVALID' };
-  }
+  return JSON.stringify(ordered);
+}
+
+function validateCommonEnvelopeFields(obj: Record<string, unknown>): { ok: true; issuedMs: number; expiresMs: number } | { ok: false; code: string } {
   if (
     typeof obj.repository_owner !== 'string' ||
     !OWNER_RE.test(obj.repository_owner) ||
@@ -186,7 +240,67 @@ export function validateExecutionEnvelopeShape(
   if (expiresMs <= issuedMs || expiresMs - issuedMs > MAX_ENVELOPE_TTL_MS) {
     return { ok: false, code: 'EXEC_REQ_TTL_WINDOW_INVALID' };
   }
+  return { ok: true, issuedMs, expiresMs };
+}
+
+export function validateExecutionEnvelopeShape(
+  raw: unknown,
+): { ok: true; envelope: ExecutionRequestEnvelopeV1 } | { ok: false; code: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, code: 'EXEC_REQ_NOT_OBJECT' };
+  }
+  const obj = raw as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  if (keys.join(',') !== ENVELOPE_KEYS.join(',')) {
+    return { ok: false, code: 'EXEC_REQ_SCHEMA_MISMATCH' };
+  }
+  if (obj.protocol_version !== EXECUTION_REQUEST_PROTOCOL_VERSION) {
+    return { ok: false, code: 'EXEC_REQ_UNSUPPORTED_VERSION' };
+  }
+  if (obj.authorized_capability !== AUTHORIZED_CAPABILITY_V1) {
+    return { ok: false, code: 'EXEC_REQ_CAPABILITY_INVALID' };
+  }
+  const common = validateCommonEnvelopeFields(obj);
+  if (!common.ok) return common;
   return { ok: true, envelope: obj as unknown as ExecutionRequestEnvelopeV1 };
+}
+
+export function validateExecutionEnvelopeV2Shape(
+  raw: unknown,
+): { ok: true; envelope: ExecutionRequestEnvelopeV2 } | { ok: false; code: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, code: 'EXEC_REQ_NOT_OBJECT' };
+  }
+  const obj = raw as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  if (keys.join(',') !== ENVELOPE_V2_KEYS.join(',')) {
+    return { ok: false, code: 'EXEC_REQ_SCHEMA_MISMATCH' };
+  }
+  if (obj.protocol_version !== EXECUTION_REQUEST_PROTOCOL_VERSION_V2) {
+    return { ok: false, code: 'EXEC_REQ_UNSUPPORTED_VERSION' };
+  }
+  if (obj.authorized_capability !== AUTHORIZED_CAPABILITY_V2) {
+    return { ok: false, code: 'EXEC_REQ_CAPABILITY_INVALID' };
+  }
+  if (typeof obj.broker_issuer !== 'string' || !ISSUER_RE.test(obj.broker_issuer)) {
+    return { ok: false, code: 'EXEC_REQ_ISSUER_INVALID' };
+  }
+  if (typeof obj.audience !== 'string' || !AUDIENCE_RE.test(obj.audience)) {
+    return { ok: false, code: 'EXEC_REQ_AUDIENCE_INVALID' };
+  }
+  if (typeof obj.device_id !== 'string' || !DEVICE_ID_RE.test(obj.device_id)) {
+    return { ok: false, code: 'EXEC_REQ_DEVICE_ID_INVALID' };
+  }
+  if (
+    typeof obj.enrollment_generation !== 'number' ||
+    !Number.isSafeInteger(obj.enrollment_generation) ||
+    obj.enrollment_generation < 1
+  ) {
+    return { ok: false, code: 'EXEC_REQ_ENROLLMENT_GEN_INVALID' };
+  }
+  const common = validateCommonEnvelopeFields(obj);
+  if (!common.ok) return common;
+  return { ok: true, envelope: obj as unknown as ExecutionRequestEnvelopeV2 };
 }
 
 export function signExecutionRequestHmac(
@@ -211,6 +325,45 @@ export function signExecutionRequestHmac(
   };
 }
 
+export function signExecutionRequestEd25519(
+  envelope: ExecutionRequestEnvelopeV2,
+  privateKeyPem: string,
+  keyId: string,
+): SignedExecutionRequestV2 {
+  const checked = validateExecutionEnvelopeV2Shape(envelope);
+  if (!checked.ok) {
+    throw Error(checked.code);
+  }
+  if (!privateKeyPem || !privateKeyPem.includes('BEGIN PRIVATE KEY') || !keyId) {
+    throw Error('SIGNING_KEY_CONFIG_INVALID');
+  }
+  const signingInput = V2_DOMAIN_PREFIX + serializeCanonicalExecutionEnvelopeV2(checked.envelope);
+  const signature = cryptoSign(null, Buffer.from(signingInput, 'utf8'), privateKeyPem);
+  return {
+    envelope: checked.envelope,
+    signature_alg: 'Ed25519',
+    key_id: keyId,
+    signature_b64url: signature.toString('base64url'),
+  };
+}
+
+export function verifyExecutionRequestEd25519Signature(
+  request: SignedExecutionRequestV2,
+  publicKeyPem: string,
+): boolean {
+  try {
+    const keyObj = createPublicKey(publicKeyPem);
+    if (keyObj.asymmetricKeyType !== 'ed25519') {
+      return false;
+    }
+    const signingInput = V2_DOMAIN_PREFIX + serializeCanonicalExecutionEnvelopeV2(request.envelope);
+    const sigBuf = Buffer.from(request.signature_b64url, 'base64url');
+    return cryptoVerify(null, Buffer.from(signingInput, 'utf8'), keyObj, sigBuf);
+  } catch {
+    return false;
+  }
+}
+
 export interface PersistentReplayStore {
   hasDelivery(deliveryId: string): Promise<boolean> | boolean;
   hasOrReservedAttempt(attemptId: string): Promise<boolean> | boolean;
@@ -224,6 +377,12 @@ export interface PersistentReplayStore {
   recordNonDispatchDelivery?(deliveryId: string): Promise<void>;
 }
 
+export type DeviceRevocationChecker = (info: {
+  workerId: string;
+  deviceId?: string;
+  enrollmentGeneration?: number;
+}) => Promise<{ revoked: boolean; code?: string }> | { revoked: boolean; code?: string };
+
 export interface ExecutionVerifierConfig {
   expectedRepositoryOwner: string;
   expectedRepositoryName: string;
@@ -231,9 +390,19 @@ export interface ExecutionVerifierConfig {
   expectedInstallationId: string;
   expectedWorkerId: string;
   pinnedApp: PinnedDispatcherApp;
-  hmacKeysById: ReadonlyMap<string, string>;
+  hmacKeysById?: ReadonlyMap<string, string>;
   haltHmacKeysById?: ReadonlyMap<string, string>;
   allowRemoteHalt?: boolean;
+  // F3-00 / F3-04: Default-OFF asymmetric Ed25519 v2 protocol + downgrade protection
+  asymmetricV2Enabled?: boolean;
+  requireAsymmetricV2?: boolean;
+  publicKeysById?: ReadonlyMap<string, string>;
+  haltPublicKeysById?: ReadonlyMap<string, string>;
+  expectedAudience?: string;
+  expectedBrokerIssuer?: string;
+  expectedDeviceId?: string;
+  minEnrollmentGeneration?: number;
+  deviceRevocationChecker?: DeviceRevocationChecker;
   provider: GitHubAuthorityProvider;
   replayStore?: PersistentReplayStore;
   nowMs?: () => number;
@@ -265,6 +434,7 @@ export class ExecutionRequestVerifier {
   }
 
   private resolveKeyForAction(action: ExecutionAction, keyId: string): { ok: true; secret: string } | { ok: false; code: string } {
+    const hmacKeys = this.config.hmacKeysById ?? new Map<string, string>();
     if (action === 'HALT') {
       if (this.config.allowRemoteHalt !== true) {
         return { ok: false, code: 'EXEC_REQ_REMOTE_HALT_DISABLED' };
@@ -273,12 +443,11 @@ export class ExecutionRequestVerifier {
       if (!haltSecret || haltSecret.length < 16) {
         return { ok: false, code: 'EXEC_REQ_HALT_KEY_UNAUTHORIZED' };
       }
-      // Prevent accidental or deliberate reuse of ordinary dispatch secrets for HALT
-      const dispatchSecretSameId = this.config.hmacKeysById.get(keyId);
+      const dispatchSecretSameId = hmacKeys.get(keyId);
       if (dispatchSecretSameId === haltSecret) {
         return { ok: false, code: 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' };
       }
-      for (const dispatchSecret of this.config.hmacKeysById.values()) {
+      for (const dispatchSecret of hmacKeys.values()) {
         if (dispatchSecret === haltSecret) {
           return { ok: false, code: 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' };
         }
@@ -286,18 +455,43 @@ export class ExecutionRequestVerifier {
       return { ok: true, secret: haltSecret };
     }
 
-    const secret = this.config.hmacKeysById.get(keyId);
+    const secret = hmacKeys.get(keyId);
     if (!secret || secret.length < 16) {
       return { ok: false, code: 'EXEC_REQ_SIGNING_KEY_UNKNOWN' };
     }
     return { ok: true, secret };
   }
 
+  private resolvePublicKeyForActionV2(action: ExecutionAction, keyId: string): { ok: true; publicKeyPem: string } | { ok: false; code: string } {
+    const pubKeys = this.config.publicKeysById ?? new Map<string, string>();
+    if (action === 'HALT') {
+      if (this.config.allowRemoteHalt !== true) {
+        return { ok: false, code: 'EXEC_REQ_REMOTE_HALT_DISABLED' };
+      }
+      const haltPub = this.config.haltPublicKeysById?.get(keyId);
+      if (!haltPub || !haltPub.includes('BEGIN PUBLIC KEY')) {
+        return { ok: false, code: 'EXEC_REQ_HALT_KEY_UNAUTHORIZED' };
+      }
+      for (const execPub of pubKeys.values()) {
+        if (execPub.trim() === haltPub.trim()) {
+          return { ok: false, code: 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' };
+        }
+      }
+      return { ok: true, publicKeyPem: haltPub };
+    }
+
+    const pub = pubKeys.get(keyId);
+    if (!pub || !pub.includes('BEGIN PUBLIC KEY')) {
+      return { ok: false, code: 'EXEC_REQ_SIGNING_KEY_UNKNOWN' };
+    }
+    return { ok: true, publicKeyPem: pub };
+  }
+
   async verifyAndAuthorize(rawRequest: unknown): Promise<
     | {
         ok: true;
         code: 'EXECUTION_REQUEST_AUTHORIZED';
-        envelope: ExecutionRequestEnvelopeV1;
+        envelope: AnyExecutionRequestEnvelope;
         ticket: ValidTicket;
       }
     | { ok: false; code: string }
@@ -306,36 +500,105 @@ export class ExecutionRequestVerifier {
       return { ok: false, code: 'EXEC_REQ_WRAPPER_INVALID' };
     }
     const wrapper = rawRequest as Record<string, unknown>;
-    if (
-      Object.keys(wrapper).sort().join(',') !== 'envelope,key_id,signature_alg,signature_hex' ||
-      wrapper.signature_alg !== 'HMAC-SHA256' ||
-      typeof wrapper.key_id !== 'string' ||
-      typeof wrapper.signature_hex !== 'string' ||
-      !HEX64_RE.test(wrapper.signature_hex)
-    ) {
-      return { ok: false, code: 'EXEC_REQ_SIGNATURE_ENVELOPE_INVALID' };
+    const rawEnv = wrapper.envelope;
+    const rawVersion =
+      rawEnv && typeof rawEnv === 'object' && !Array.isArray(rawEnv)
+        ? (rawEnv as Record<string, unknown>).protocol_version
+        : undefined;
+
+    let env: AnyExecutionRequestEnvelope;
+    let isV2 = false;
+
+    if (rawVersion === EXECUTION_REQUEST_PROTOCOL_VERSION_V2 && this.config.asymmetricV2Enabled === true) {
+      isV2 = true;
+      if (wrapper.signature_alg === 'HMAC-SHA256') {
+        return { ok: false, code: 'EXEC_REQ_ALGORITHM_MISMATCH' };
+      }
+      if (
+        Object.keys(wrapper).sort().join(',') !== 'envelope,key_id,signature_alg,signature_b64url' ||
+        wrapper.signature_alg !== 'Ed25519' ||
+        typeof wrapper.key_id !== 'string' ||
+        typeof wrapper.signature_b64url !== 'string' ||
+        !B64URL_SIG_RE.test(wrapper.signature_b64url)
+      ) {
+        return { ok: false, code: 'EXEC_REQ_SIGNATURE_ENVELOPE_INVALID' };
+      }
+
+      const shapeV2 = validateExecutionEnvelopeV2Shape(rawEnv);
+      if (!shapeV2.ok) {
+        return shapeV2;
+      }
+      const envV2 = shapeV2.envelope;
+      const keyRes = this.resolvePublicKeyForActionV2(envV2.action, wrapper.key_id);
+      if (!keyRes.ok) {
+        return keyRes;
+      }
+      const validSig = verifyExecutionRequestEd25519Signature(
+        {
+          envelope: envV2,
+          signature_alg: 'Ed25519',
+          key_id: wrapper.key_id,
+          signature_b64url: wrapper.signature_b64url,
+        },
+        keyRes.publicKeyPem,
+      );
+      if (!validSig) {
+        return { ok: false, code: 'EXEC_REQ_SIGNATURE_INVALID' };
+      }
+      if (this.config.expectedBrokerIssuer && envV2.broker_issuer !== this.config.expectedBrokerIssuer) {
+        return { ok: false, code: 'EXEC_REQ_ISSUER_MISMATCH' };
+      }
+      const expectedAud =
+        this.config.expectedAudience ??
+        buildExecutionAudience(`${this.config.expectedRepositoryOwner}/${this.config.expectedRepositoryName}`, this.config.expectedWorkerId);
+      if (envV2.audience !== expectedAud) {
+        return { ok: false, code: 'EXEC_REQ_AUDIENCE_MISMATCH' };
+      }
+      if (this.config.expectedDeviceId && envV2.device_id !== this.config.expectedDeviceId) {
+        return { ok: false, code: 'EXEC_REQ_DEVICE_MISMATCH' };
+      }
+      if (
+        typeof this.config.minEnrollmentGeneration === 'number' &&
+        envV2.enrollment_generation < this.config.minEnrollmentGeneration
+      ) {
+        return { ok: false, code: 'EXEC_REQ_ENROLLMENT_STALE' };
+      }
+      env = envV2;
+    } else {
+      if (
+        this.config.requireAsymmetricV2 === true &&
+        rawVersion === EXECUTION_REQUEST_PROTOCOL_VERSION
+      ) {
+        return { ok: false, code: 'EXEC_REQ_DOWNGRADE_FORBIDDEN' };
+      }
+      if (
+        Object.keys(wrapper).sort().join(',') !== 'envelope,key_id,signature_alg,signature_hex' ||
+        wrapper.signature_alg !== 'HMAC-SHA256' ||
+        typeof wrapper.key_id !== 'string' ||
+        typeof wrapper.signature_hex !== 'string' ||
+        !HEX64_RE.test(wrapper.signature_hex)
+      ) {
+        return { ok: false, code: 'EXEC_REQ_SIGNATURE_ENVELOPE_INVALID' };
+      }
+
+      const shape = validateExecutionEnvelopeShape(wrapper.envelope);
+      if (!shape.ok) {
+        return shape;
+      }
+      const envV1 = shape.envelope;
+      const keyResolution = this.resolveKeyForAction(envV1.action, wrapper.key_id);
+      if (!keyResolution.ok) {
+        return keyResolution;
+      }
+      const canonical = serializeCanonicalExecutionEnvelope(envV1);
+      const expectedSig = createHmac('sha256', keyResolution.secret).update(canonical, 'utf8').digest();
+      const actualSig = Buffer.from(wrapper.signature_hex, 'hex');
+      if (expectedSig.length !== actualSig.length || !timingSafeEqual(expectedSig, actualSig)) {
+        return { ok: false, code: 'EXEC_REQ_SIGNATURE_INVALID' };
+      }
+      env = envV1;
     }
 
-    const shape = validateExecutionEnvelopeShape(wrapper.envelope);
-    if (!shape.ok) {
-      return shape;
-    }
-    const env = shape.envelope;
-
-    const keyResolution = this.resolveKeyForAction(env.action, wrapper.key_id);
-    if (!keyResolution.ok) {
-      return keyResolution;
-    }
-    const secret = keyResolution.secret;
-
-    const canonical = serializeCanonicalExecutionEnvelope(env);
-    const expectedSig = createHmac('sha256', secret).update(canonical, 'utf8').digest();
-    const actualSig = Buffer.from(wrapper.signature_hex, 'hex');
-    if (expectedSig.length !== actualSig.length || !timingSafeEqual(expectedSig, actualSig)) {
-      return { ok: false, code: 'EXEC_REQ_SIGNATURE_INVALID' };
-    }
-
-    // Bind exact server-configured repository, installation & worker identity
     if (
       env.repository_owner !== this.config.expectedRepositoryOwner ||
       env.repository_name !== this.config.expectedRepositoryName ||
@@ -360,6 +623,17 @@ export class ExecutionRequestVerifier {
       return { ok: false, code: 'EXEC_REQ_EXPIRED' };
     }
 
+    if (this.config.deviceRevocationChecker) {
+      const rev = await this.config.deviceRevocationChecker({
+        workerId: env.worker_id,
+        deviceId: isV2 ? (env as ExecutionRequestEnvelopeV2).device_id : undefined,
+        enrollmentGeneration: isV2 ? (env as ExecutionRequestEnvelopeV2).enrollment_generation : undefined,
+      });
+      if (rev.revoked) {
+        return { ok: false, code: rev.code || 'EXEC_REQ_DEVICE_REVOKED' };
+      }
+    }
+
     return this.withExclusiveLock(async () => {
       if (this.seenDeliveries.has(env.delivery_id) || (await this.config.replayStore?.hasDelivery(env.delivery_id))) {
         return { ok: false, code: 'EXEC_REQ_DELIVERY_REPLAY' };
@@ -372,7 +646,6 @@ export class ExecutionRequestVerifier {
         return { ok: false, code: 'EXEC_REQ_ATTEMPT_REPLAY' };
       }
 
-      // Verify live GitHub installation & repository authority before accepting request
       const fullRepo = `${env.repository_owner}/${env.repository_name}`;
       const installCheck = await this.config.provider.verifyInstallationScope(
         fullRepo,

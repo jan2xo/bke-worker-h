@@ -46,15 +46,18 @@ Run from `bke-worker/`:
 
 ## 3. Human-Controlled Desktop Setup (F1-01 to F2-08)
 
-1. Copy `deploy/desktop-controller.env.example` to a private file (`~/.config/bke-worker/f1-controller.env`, `chmod 600`) and populate repository, repository ID, installation identity, PR number, worker ID, pinned app ID/slug, and loopback secrets (`BKE_WEBHOOK_SECRET`, `BKE_OPERATOR_HALT_TOKEN`). Keep `BKE_EXECUTION_ENVELOPE_ENABLED=false` unless configuring isolated server-signed envelope keys (`BKE_EXECUTION_SIGNING_KEY` must never reuse `BKE_WEBHOOK_SECRET` or `BKE_OPERATOR_HALT_TOKEN`).
-2. Copy `deploy/owner-native-policy.template.json` to `~/.config/bke-worker/native-host/owner-policy.json` (`chmod 600`) and fill in your owner-verified extension origin, P-256 key thumbprint SHA-256, profile/target hashes, and expiration timestamp (`<= 30 days`).
-3. Create and manually sign into the isolated Chrome profile via `bash scripts/forge-f1-desktop-readiness.sh` (`CREATE_AND_LAUNCH_ISOLATED_CHROME_PROFILE`). Load the unpacked extension from `artifacts/desktop-worker-package/extension` (or `browser-extension/`).
-4. Prepare the user-level Chrome Native Messaging host manifest transactionally:
+1. Copy `deploy/desktop-controller.env.example` to a private file (`~/.config/bke-worker/f1-controller.env`, `chmod 600`) and populate repository, repository ID, installation identity, PR number, worker ID, pinned app ID/slug, and loopback secrets (`BKE_WEBHOOK_SECRET`, `BKE_OPERATOR_HALT_TOKEN`). Keep `BKE_EXECUTION_ENVELOPE_ENABLED=false`, `BKE_EXECUTION_V2_ASYMMETRIC_ENABLED=false`, `BKE_REQUIRE_ASYMMETRIC_V2=false`, and `BKE_REMOTE_BROKER_ENABLED=false` unless explicitly operating against an owner-authorized broker.
+2. When enabling **F3 Asymmetric V2 (`Ed25519`)** mode on an enrolled device:
+   - Set `BKE_DEVICE_ID`, `BKE_MIN_ENROLLMENT_GENERATION`, `BKE_BROKER_ISSUER`, `BKE_EXECUTION_AUDIENCE`, `BKE_BROKER_PUBLIC_KEY_ID`, `BKE_BROKER_PUBLIC_KEY_PEM`, `BKE_REMOTE_HALT_PUBLIC_KEY_ID`, and `BKE_REMOTE_HALT_PUBLIC_KEY_PEM`.
+   - `BKE_BROKER_PUBLIC_KEY_PEM` and `BKE_REMOTE_HALT_PUBLIC_KEY_PEM` MUST be strictly distinct keys (`DAEMON_HALT_KEY_SEPARATION_FORBIDDEN` otherwise). Only public SPKI PEMs are ever placed on the desktop.
+3. Copy `deploy/owner-native-policy.template.json` to `~/.config/bke-worker/native-host/owner-policy.json` (`chmod 600`) and fill in your owner-verified extension origin, P-256 key thumbprint SHA-256, profile/target hashes, and expiration timestamp (`<= 30 days`).
+4. Create and manually sign into the isolated Chrome profile via `bash scripts/forge-f1-desktop-readiness.sh` (`CREATE_AND_LAUNCH_ISOLATED_CHROME_PROFILE`). Load the unpacked extension from `artifacts/desktop-worker-package/extension` (or `browser-extension/`).
+5. Prepare the user-level Chrome Native Messaging host manifest transactionally:
    ```bash
    BKE_NATIVE_HOST_EXTENSION_ORIGIN="chrome-extension://<32-char-id>/" \
      bash scripts/prepare-chrome-native-host.sh install
    ```
-5. In the Chrome extension popup, click **Connect controller bridge (opt-in)** only when an owner-approved policy is active; Chrome prompts for the optional `nativeMessaging` permission exclusively upon that explicit user click.
+6. In the Chrome extension popup, click **Connect controller bridge (opt-in)** only when an owner-approved policy is active; Chrome prompts for the optional `nativeMessaging` permission exclusively upon that explicit user click.
 
 ---
 
@@ -70,7 +73,15 @@ npm --prefix browser-extension run controller:cli -- start
 ```
 
 ### Checking Persisted State, HTTP Diagnostics & Emergency Halt
-The loopback daemon exposes secret-free diagnostics on `GET http://127.0.0.1:31940/status` (repository, worker ID, active PR, `expectedHeadSha`, `daemonRunning`, `nativeTransportReady`, `executionEnvelopeEnabled`, `trustedAuthorityConfigured`, 5-flag `tokenLifecycle` state, `quarantined`, `humanLiveSendAuthorized`, and `missingOwnerPrerequisites`). No tokens, cookies, PEMs, or secrets are returned or logged.
+The loopback daemon exposes secret-free **v3 diagnostics** on `GET http://127.0.0.1:31940/status` and `npm --prefix browser-extension run controller:doctor`, including:
+- `repository`, `prNumber`, `workerId`, `expectedHeadSha`, `daemonRunning`, `nativeTransportReady`
+- `deviceIdentity` (`deviceId`, `policyConfigured`, `enrollmentGeneration`)
+- `broker` (`protocolVersion`, `endpointConfigured`, `brokerAvailable`, `asymmetricV2Enabled`, `requireAsymmetricV2`, `remoteHaltPublicKeysConfigured`)
+- `installationScope` (`repositoryId`, `installationId`, `configured`) and `workerAssignment` (`workerId`, `prNumber`, `confirmedTurnCount`, `conversationId`)
+- `tokenLifecycle` (`valid`, `brokerConnected`, `brokerKind`, `expired`, `revoked`, `lastRecoveryClassification`)
+- `quarantined`, `humanLiveSendAuthorized`, and `missingOwnerPrerequisites` (e.g., `TRUSTED_REMOTE_BROKER_NOT_CONNECTED`, `REAL_CHROME_ACCEPTANCE_NOT_RUN`)
+
+No tokens, cookies, PEM private keys, or prompts are returned or logged.
 
 ```bash
 # Inspect journal state without secrets:
@@ -87,6 +98,15 @@ curl -sS -X POST http://127.0.0.1:31940/halt \
 ```
 
 > **Halt authentication rule**: `POST /halt` requires `x-bke-halt-token` matching `BKE_OPERATOR_HALT_TOKEN` using constant-time SHA-256 comparison and loopback binding. Requests using `Authorization: Bearer ...` or missing `x-bke-halt-token` fail closed with `HTTP 403` (`OPERATOR_HALT_UNAUTHORIZED`). Owner `POST /halt` remains operational even when ordinary execution is blocked (`DELIVERY_UNCERTAIN`).
+
+### F3-06 Failure Classification: Auto-Retryable vs Human Reconciliation Required
+
+| Failure Stage | Code / Trigger | Recovery Class | Operator / Runtime Behavior |
+|---|---|---|---|
+| Pre-claim scoped token mint/refresh | `TOKEN_BROKER_UNAVAILABLE` or `TOKEN_BROKER_TIMEOUT` before `POST /git/refs` | `PRE_CLAIM_AUTO_RETRY_SAFE` | `ManagedTokenProvider` performs bounded deadline-checked retry before claim; if exhausted, wake aborts cleanly with zero GitHub writes (`IDLE`). |
+| Device revoked / token permanently denied | `TOKEN_REVOKED`, `EXEC_REQ_DEVICE_REVOKED`, `BROKER_PERMISSION_*` | `NON_RETRYABLE_ERROR` | Fail closed immediately; never auto-retry. Owner must re-enroll/rotate device or re-verify permissions. |
+| GitHub claim or fence POST uncertain | Network drop / timeout after `POST /git/refs` or lying read-back | `DELIVERY_UNCERTAIN` (Human Reconciliation) | Writes `refs/bke/uncertain/<pr>/<attempt>` if reachable, quarantines journal, **never auto-retries**. |
+| ChatGPT send initiated / bridge disconnect mid-dispatch | Socket drop or stalled DOM click after submit start | `DELIVERY_UNCERTAIN` (Human Reconciliation) | Transitions journal to `DELIVERY_UNCERTAIN`, blocks future dispatches (`HTTP 409`) until owner inspects ChatGPT tab & GitHub refs. |
 
 ### Handling `DELIVERY_UNCERTAIN` Quarantine
 If an HTTP `POST /git/refs`, ChatGPT click submit, or mid-flight IPC socket disconnect occurs cleanly *before* confirmation, the controller and ledger:

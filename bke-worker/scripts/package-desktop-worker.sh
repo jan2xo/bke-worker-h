@@ -166,6 +166,12 @@ package_bundle() {
     || fail "BKE_HUMAN_LIVE_SEND_AUTHORIZED must default false in deploy template"
   grep -q '^BKE_EXECUTION_ENVELOPE_ENABLED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
     || fail "BKE_EXECUTION_ENVELOPE_ENABLED must default false in deploy template"
+  grep -q '^BKE_EXECUTION_V2_ASYMMETRIC_ENABLED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
+    || fail "BKE_EXECUTION_V2_ASYMMETRIC_ENABLED must default false in deploy template"
+  grep -q '^BKE_REQUIRE_ASYMMETRIC_V2=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
+    || fail "BKE_REQUIRE_ASYMMETRIC_V2 must default false in deploy template"
+  grep -q '^BKE_REMOTE_BROKER_ENABLED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
+    || fail "BKE_REMOTE_BROKER_ENABLED must default false in deploy template"
 
   local out_parent
   out_parent="$(dirname -- "$OUT_DIR")"

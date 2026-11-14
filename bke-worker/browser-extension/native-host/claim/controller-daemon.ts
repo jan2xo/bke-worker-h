@@ -70,6 +70,22 @@ export interface ControllerRuntimeConfig {
   executionSigningKeysById?: ReadonlyMap<string, string>;
   remoteHaltSigningKeysById?: ReadonlyMap<string, string>;
   allowRemoteSignedHalt?: boolean;
+  // F3-00 / F3-04: Default-OFF asymmetric Ed25519 v2 protocol & device identity binding
+  asymmetricV2Enabled?: boolean;
+  requireAsymmetricV2?: boolean;
+  executionPublicKeysById?: ReadonlyMap<string, string>;
+  remoteHaltPublicKeysById?: ReadonlyMap<string, string>;
+  expectedAudience?: string;
+  expectedBrokerIssuer?: string;
+  expectedDeviceId?: string;
+  minEnrollmentGeneration?: number;
+  deviceRevocationChecker?: (info: {
+    workerId: string;
+    deviceId?: string;
+    enrollmentGeneration?: number;
+  }) => Promise<{ revoked: boolean; code?: string }> | { revoked: boolean; code?: string };
+  brokerAvailable?: boolean;
+  brokerEndpointConfigured?: boolean;
   githubApiBaseUrl?: string;
 }
 
@@ -172,6 +188,12 @@ function mapVerifierRejectionHttpStatus(code: string): number {
     code === 'EXEC_REQ_WORKER_MISMATCH' ||
     code === 'EXEC_REQ_REMOTE_HALT_DISABLED' ||
     code === 'EXEC_REQ_HALT_KEY_SEPARATION_REQUIRED' ||
+    code === 'EXEC_REQ_AUDIENCE_MISMATCH' ||
+    code === 'EXEC_REQ_ISSUER_MISMATCH' ||
+    code === 'EXEC_REQ_DEVICE_MISMATCH' ||
+    code === 'EXEC_REQ_DEVICE_REVOKED' ||
+    code === 'EXEC_REQ_ENROLLMENT_STALE' ||
+    code === 'EXEC_REQ_DOWNGRADE_FORBIDDEN' ||
     code === 'GITHUB_PERMISSION_FORBIDDEN'
   ) {
     return 403;
@@ -184,6 +206,11 @@ function mapVerifierRejectionHttpStatus(code: string): number {
     code === 'EXEC_REQ_UNSUPPORTED_VERSION' ||
     code === 'EXEC_REQ_CAPABILITY_INVALID' ||
     code === 'EXEC_REQ_ACTION_FORBIDDEN' ||
+    code === 'EXEC_REQ_ALGORITHM_MISMATCH' ||
+    code === 'EXEC_REQ_AUDIENCE_INVALID' ||
+    code === 'EXEC_REQ_ISSUER_INVALID' ||
+    code === 'EXEC_REQ_DEVICE_ID_INVALID' ||
+    code === 'EXEC_REQ_ENROLLMENT_GEN_INVALID' ||
     code === 'EXEC_REQ_TIMESTAMPS_INVALID' ||
     code === 'EXEC_REQ_TTL_WINDOW_INVALID'
   ) {
@@ -279,6 +306,15 @@ export class DesktopControllerDaemon {
         }
       }
     }
+    if (config.remoteHaltPublicKeysById && config.executionPublicKeysById) {
+      for (const haltPub of config.remoteHaltPublicKeysById.values()) {
+        for (const execPub of config.executionPublicKeysById.values()) {
+          if (haltPub.trim() === execPub.trim()) {
+            throw Error('DAEMON_HALT_KEY_SEPARATION_FORBIDDEN');
+          }
+        }
+      }
+    }
 
     const nowIso = deps.nowIso ?? (() => new Date().toISOString());
     const nowMs = deps.nowMs ?? (() => Date.now());
@@ -337,6 +373,7 @@ export class DesktopControllerDaemon {
             targetId: config.targetId,
             profileId: config.profileId,
             targetTabId: config.targetTabId,
+            baseApiUrl: config.githubApiBaseUrl,
             nowIso,
           },
           fetchImpl,
@@ -365,6 +402,12 @@ export class DesktopControllerDaemon {
     });
 
     const [owner, repoName] = config.repository.split('/');
+    const hasV1Keys = Boolean(config.executionSigningKeysById && config.executionSigningKeysById.size > 0);
+    const hasV2Keys = Boolean(
+      config.asymmetricV2Enabled === true &&
+      config.executionPublicKeysById &&
+      config.executionPublicKeysById.size > 0,
+    );
     if (
       config.executionEnvelopeEnabled === true &&
       owner &&
@@ -374,8 +417,7 @@ export class DesktopControllerDaemon {
       config.expectedRepositoryId > 0 &&
       typeof config.expectedInstallationId === 'string' &&
       config.expectedInstallationId.length > 0 &&
-      config.executionSigningKeysById &&
-      config.executionSigningKeysById.size > 0
+      (hasV1Keys || hasV2Keys)
     ) {
       this.executionVerifier = new ExecutionRequestVerifier({
         expectedRepositoryOwner: owner,
@@ -387,6 +429,15 @@ export class DesktopControllerDaemon {
         hmacKeysById: config.executionSigningKeysById,
         haltHmacKeysById: config.remoteHaltSigningKeysById,
         allowRemoteHalt: config.allowRemoteSignedHalt === true,
+        asymmetricV2Enabled: config.asymmetricV2Enabled === true,
+        requireAsymmetricV2: config.requireAsymmetricV2 === true,
+        publicKeysById: config.executionPublicKeysById,
+        haltPublicKeysById: config.remoteHaltPublicKeysById,
+        expectedAudience: config.expectedAudience,
+        expectedBrokerIssuer: config.expectedBrokerIssuer,
+        expectedDeviceId: config.expectedDeviceId,
+        minEnrollmentGeneration: config.minEnrollmentGeneration,
+        deviceRevocationChecker: config.deviceRevocationChecker,
         provider: this.authorityProvider,
         replayStore: this.journal.asPersistentReplayStore(),
         nowMs,
@@ -431,12 +482,22 @@ export class DesktopControllerDaemon {
       missingOwnerPrerequisites.push('REAL_CHROME_ACCEPTANCE_NOT_RUN');
     }
 
+    const brokerProtocolVersion =
+      this.config.asymmetricV2Enabled === true
+        ? this.config.requireAsymmetricV2 === true
+          ? 'v2_ed25519_strict'
+          : 'v2_ed25519_with_v1_compat'
+        : this.config.executionEnvelopeEnabled === true
+          ? 'v1_hmac'
+          : 'DISABLED';
+
     return {
-      version: 2,
+      version: 3,
       repository: state.repository,
       prNumber: state.prNumber,
       workerId: state.workerId,
       expectedHeadSha: state.lastExpectedHeadSha ?? null,
+      currentExactSha: state.lastExpectedHeadSha ?? null,
       daemonRunning: this.started && !this.stopping,
       journalPhase: state.phase,
       quarantined,
@@ -446,7 +507,32 @@ export class DesktopControllerDaemon {
       nativeTransportReady: this.started && !this.stopping && !this.ipcClient.isQuarantined(),
       ipcClientQuarantined: this.ipcClient.isQuarantined(),
       executionEnvelopeEnabled: this.config.executionEnvelopeEnabled === true,
+      asymmetricV2Enabled: this.config.asymmetricV2Enabled === true,
+      requireAsymmetricV2: this.config.requireAsymmetricV2 === true,
       trustedAuthorityConfigured,
+      deviceIdentity: {
+        deviceId: this.config.expectedDeviceId ?? null,
+        enrollmentGeneration: this.config.minEnrollmentGeneration ?? null,
+        policyConfigured: Boolean(this.config.policyPath),
+      },
+      broker: {
+        available: Boolean(this.config.brokerAvailable),
+        protocolVersion: brokerProtocolVersion,
+        endpointConfigured: Boolean(this.config.brokerEndpointConfigured),
+        trustedRealBrokerApiAvailable: tokenStatus.trustedRealBrokerApiAvailable,
+        realBrokerTransportConnected: tokenStatus.realBrokerTransportConnected,
+      },
+      installationScope: {
+        expectedInstallationId: this.config.expectedInstallationId ?? null,
+        expectedRepositoryId: this.config.expectedRepositoryId ?? null,
+        validated: trustedAuthorityConfigured && !quarantined,
+      },
+      workerAssignment: {
+        workerId: state.workerId,
+        repository: state.repository,
+        prNumber: state.prNumber,
+        verifiedByLiveAuthority: Boolean(state.lastExpectedHeadSha),
+      },
       credentialProviderAvailable:
         tokenStatus.hasCachedToken || tokenStatus.mockBrokerSupported || tokenStatus.realBrokerTransportConnected,
       tokenLifecycle: tokenStatus,
@@ -773,7 +859,14 @@ export interface DoctorCheckResult {
     repository: string;
     prNumber: number | null;
     workerId: string | null;
+    deviceIdentityStatus: 'UNPAIRED_OR_UNCONFIGURED' | 'POLICY_CONFIGURED';
+    deviceId: string | null;
+    trustedBrokerAvailable: boolean;
+    brokerProtocolVersion: 'DISABLED' | 'v1_hmac' | 'v2_ed25519_compat' | 'v2_ed25519_strict';
+    installationScopeConfigured: boolean;
+    workerAssignmentConfigured: boolean;
     executionEnvelopeEnabled: boolean;
+    asymmetricV2Enabled: boolean;
     trustedAuthorityConfigured: boolean;
     credentialProviderAvailable: boolean;
     credentialBrokerKind: 'MOCK_BROKER' | 'REMOTE_DISABLED' | 'UNCONFIGURED';
@@ -805,6 +898,18 @@ export async function runControllerDoctor(env: Record<string, string | undefined
     detail: envelopeEnabled ? 'ENABLED' : 'DISABLED_BY_DEFAULT',
   });
 
+  const asymmetricV2Enabled = env.BKE_EXECUTION_V2_ASYMMETRIC_ENABLED === 'true';
+  const requireV2Strict = env.BKE_REQUIRE_ASYMMETRIC_V2 === 'true';
+  checks.push({
+    name: 'broker_protocol_mode',
+    ok: true,
+    detail: asymmetricV2Enabled
+      ? requireV2Strict
+        ? 'V2_ED25519_STRICT'
+        : 'V2_ED25519_COMPAT'
+      : 'DISABLED_BY_DEFAULT',
+  });
+
   const journalPath = env.BKE_JOURNAL_PATH;
   if (journalPath) {
     if (!isAbsolute(journalPath)) {
@@ -834,6 +939,7 @@ export async function runControllerDoctor(env: Record<string, string | undefined
     }
   }
 
+  let policyConfigured = false;
   const policyPath = env.BKE_NATIVE_POLICY_PATH;
   if (policyPath) {
     if (!isAbsolute(policyPath)) {
@@ -844,6 +950,7 @@ export async function runControllerDoctor(env: Record<string, string | undefined
         try {
           const st = await handle.stat();
           const safe = st.isFile() && (st.mode & 0o077) === 0;
+          policyConfigured = safe;
           checks.push({
             name: 'native_policy_file',
             ok: safe,
@@ -878,19 +985,34 @@ export async function runControllerDoctor(env: Record<string, string | undefined
     }
   }
 
-  const hasExecKey = Boolean(env.BKE_EXECUTION_SIGNING_KEY && env.BKE_EXECUTION_SIGNING_KEY_ID);
-  const trustedAuthorityConfigured =
-    envelopeEnabled &&
-    hasExecKey &&
-    Boolean(env.BKE_REPOSITORY_ID && Number(env.BKE_REPOSITORY_ID) > 0 && env.BKE_INSTALLATION_ID);
+  const hasExecKey =
+    Boolean(env.BKE_EXECUTION_SIGNING_KEY && env.BKE_EXECUTION_SIGNING_KEY_ID) ||
+    Boolean(env.BKE_BROKER_PUBLIC_KEY_PEM && env.BKE_BROKER_PUBLIC_KEY_ID);
+  const installationScopeConfigured = Boolean(
+    env.BKE_REPOSITORY_ID && Number(env.BKE_REPOSITORY_ID) > 0 && env.BKE_INSTALLATION_ID,
+  );
+  const trustedAuthorityConfigured = envelopeEnabled && hasExecKey && installationScopeConfigured;
   const hasStaticToken = Boolean(env.BKE_GITHUB_INSTALLATION_TOKEN && env.BKE_GITHUB_INSTALLATION_TOKEN.trim());
+  const trustedBrokerAvailable = env.BKE_REMOTE_BROKER_ENABLED === 'true' && Boolean(env.BKE_BROKER_BASE_URL);
+  const prParsed = env.BKE_PR_NUMBER ? Number(env.BKE_PR_NUMBER) : null;
+  const workerAssignmentConfigured = Boolean(
+    env.BKE_WORKER_ID && prParsed && Number.isSafeInteger(prParsed) && prParsed > 0,
+  );
+
   const missingOwnerPrerequisites: string[] = [];
   if (!env.BKE_OPERATOR_HALT_TOKEN) missingOwnerPrerequisites.push('OPERATOR_HALT_TOKEN_MISSING');
-  if (!hasStaticToken) missingOwnerPrerequisites.push('REAL_TOKEN_BROKER_OR_TOKEN_MISSING');
+  if (!hasStaticToken && !trustedBrokerAvailable) missingOwnerPrerequisites.push('REAL_TOKEN_BROKER_OR_TOKEN_MISSING');
   if (!trustedAuthorityConfigured) missingOwnerPrerequisites.push('TRUSTED_EXECUTION_AUTHORITY_NOT_CONFIGURED');
+  if (!trustedBrokerAvailable) missingOwnerPrerequisites.push('TRUSTED_REMOTE_BROKER_NOT_CONNECTED');
   if (env.BKE_CERT_REAL_BROWSER !== 'true') missingOwnerPrerequisites.push('REAL_CHROME_ACCEPTANCE_NOT_RUN');
 
-  const prParsed = env.BKE_PR_NUMBER ? Number(env.BKE_PR_NUMBER) : null;
+  const brokerProtocolVersion: DoctorCheckResult['summary']['brokerProtocolVersion'] = asymmetricV2Enabled
+    ? requireV2Strict
+      ? 'v2_ed25519_strict'
+      : 'v2_ed25519_compat'
+    : envelopeEnabled
+      ? 'v1_hmac'
+      : 'DISABLED';
 
   return {
     ok: checks.every((c) => c.ok),
@@ -900,10 +1022,17 @@ export async function runControllerDoctor(env: Record<string, string | undefined
       repository: env.BKE_REPOSITORY ?? 'jan2xo/bke-worker',
       prNumber: prParsed && Number.isSafeInteger(prParsed) && prParsed > 0 ? prParsed : null,
       workerId: env.BKE_WORKER_ID ?? null,
+      deviceIdentityStatus: policyConfigured ? 'POLICY_CONFIGURED' : 'UNPAIRED_OR_UNCONFIGURED',
+      deviceId: env.BKE_DEVICE_ID ?? null,
+      trustedBrokerAvailable,
+      brokerProtocolVersion,
+      installationScopeConfigured,
+      workerAssignmentConfigured,
       executionEnvelopeEnabled: envelopeEnabled,
+      asymmetricV2Enabled,
       trustedAuthorityConfigured,
-      credentialProviderAvailable: hasStaticToken,
-      credentialBrokerKind: hasStaticToken ? 'REMOTE_DISABLED' : 'UNCONFIGURED',
+      credentialProviderAvailable: hasStaticToken || trustedBrokerAvailable,
+      credentialBrokerKind: hasStaticToken || trustedBrokerAvailable ? 'REMOTE_DISABLED' : 'UNCONFIGURED',
       humanLiveSendAuthorized: liveAuthorizedEnv,
       missingOwnerPrerequisites,
     },
@@ -933,6 +1062,14 @@ function loadConfigFromEnv(env: Record<string, string | undefined>, allowLiveSen
   if (env.BKE_REMOTE_HALT_SIGNING_KEY_ID && env.BKE_REMOTE_HALT_SIGNING_KEY) {
     haltKeys.set(env.BKE_REMOTE_HALT_SIGNING_KEY_ID, env.BKE_REMOTE_HALT_SIGNING_KEY);
   }
+  const execPubKeys = new Map<string, string>();
+  if (env.BKE_BROKER_PUBLIC_KEY_ID && env.BKE_BROKER_PUBLIC_KEY_PEM) {
+    execPubKeys.set(env.BKE_BROKER_PUBLIC_KEY_ID, env.BKE_BROKER_PUBLIC_KEY_PEM);
+  }
+  const haltPubKeys = new Map<string, string>();
+  if (env.BKE_REMOTE_HALT_PUBLIC_KEY_ID && env.BKE_REMOTE_HALT_PUBLIC_KEY_PEM) {
+    haltPubKeys.set(env.BKE_REMOTE_HALT_PUBLIC_KEY_ID, env.BKE_REMOTE_HALT_PUBLIC_KEY_PEM);
+  }
 
   return {
     repository,
@@ -957,6 +1094,16 @@ function loadConfigFromEnv(env: Record<string, string | undefined>, allowLiveSen
     executionSigningKeysById: execKeys.size > 0 ? execKeys : undefined,
     remoteHaltSigningKeysById: haltKeys.size > 0 ? haltKeys : undefined,
     allowRemoteSignedHalt: env.BKE_ALLOW_REMOTE_SIGNED_HALT === 'true',
+    asymmetricV2Enabled: env.BKE_EXECUTION_V2_ASYMMETRIC_ENABLED === 'true',
+    requireAsymmetricV2: env.BKE_REQUIRE_ASYMMETRIC_V2 === 'true',
+    executionPublicKeysById: execPubKeys.size > 0 ? execPubKeys : undefined,
+    remoteHaltPublicKeysById: haltPubKeys.size > 0 ? haltPubKeys : undefined,
+    expectedAudience: env.BKE_EXECUTION_AUDIENCE,
+    expectedBrokerIssuer: env.BKE_BROKER_ISSUER,
+    expectedDeviceId: env.BKE_DEVICE_ID,
+    minEnrollmentGeneration: env.BKE_MIN_ENROLLMENT_GENERATION ? Number(env.BKE_MIN_ENROLLMENT_GENERATION) : undefined,
+    brokerEndpointConfigured: Boolean(env.BKE_BROKER_BASE_URL),
+    brokerAvailable: env.BKE_REMOTE_BROKER_ENABLED === 'true' && Boolean(env.BKE_BROKER_BASE_URL),
     githubApiBaseUrl: env.BKE_GITHUB_API_BASE_URL,
     liveProofs: {
       githubCasOwnerCertified: env.BKE_CERT_GITHUB_CAS === 'true',
