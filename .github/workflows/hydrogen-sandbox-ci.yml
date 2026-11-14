@@ -55,6 +55,7 @@ jobs:
       - name: Run F3 trusted desktop broker, enrollment, multi-process E2E & chaos suites
         working-directory: bke-worker/integrations/desktop-broker
         run: |
+          npm ci --ignore-scripts --no-audit --no-fund
           npm run check
 
       - name: Verify operator, Android, readiness & security contracts

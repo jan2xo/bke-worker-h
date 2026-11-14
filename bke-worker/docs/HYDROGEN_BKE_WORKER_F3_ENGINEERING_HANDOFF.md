@@ -106,6 +106,8 @@ All workspace files created or updated for F3 (with exact `wc -l` measurements o
 | File Path | Role in F3 | Measured Lines |
 |---|---|---:|
 | **New Sandbox Broker Package (`bke-worker/integrations/desktop-broker/`)** | | |
+| `integrations/desktop-broker/package.json` | Independent package manifest pinning `typescript` `5.8.3` & `@types/node` `22.20.5` with local `tsc` build script | 18 |
+| `integrations/desktop-broker/package-lock.json` | Committed lockfile enabling reproducible `npm ci --ignore-scripts` in CI without parent `node_modules` | 50 |
 | `integrations/desktop-broker/src/types.ts` | Canonical F3 contracts (`ExecutionRequestEnvelopeV2`, `EnrolledDeviceRecord`, `SignedAdminApproval`, `ServerMediatedLedgerOpRequest`) | 184 |
 | `integrations/desktop-broker/src/device-enrollment.ts` | `F3-02` `DeviceEnrollmentRegistry`, `signAdminApproval`, `verifyAdminApproval`, `0o600`+`O_NOFOLLOW` lock store, key rotation & revocation | 691 |
 | `integrations/desktop-broker/src/github-app-adapter.ts` | `F3-03`/`F3-05` `SandboxGitHubAppAdapter` (`redirect: 'manual'`, cross-repo exclusivity sweep, token minting & 4-op server-mediated CAS) | 570 |
@@ -126,7 +128,7 @@ All workspace files created or updated for F3 (with exact `wc -l` measurements o
 | `native-host/claim/controller-daemon.ts` | `F3-04`/`F3-09` V2 public-key constructor separation, `GET /status` v3 & `doctor` v3 secret-free summaries | 1,244 |
 | `native-host/claim/tests/f3-hardening.test.mjs` | Dedicated claim-layer tests (`4/4`): V2 crypto + downgrade/HALT separation, 3xx/`maintain` blocks, pre-claim vs non-retryable, `status` v3/`doctor` | 429 |
 | **Templates, Packaging, CI & F3 Engineering Docs** | | |
-| `/.github/workflows/hydrogen-sandbox-ci.yml` | Updated sandbox CI running `integrations/desktop-broker` `npm run check` + V2/broker default-OFF grep checks | 83 |
+| `/.github/workflows/hydrogen-sandbox-ci.yml` | Updated sandbox CI running `integrations/desktop-broker` `npm ci` + `npm run check` & V2/broker default-OFF grep checks | 84 |
 | `bke-worker/deploy/desktop-controller.env.example` | Added 12 default-OFF F3 V2 & remote-broker configuration variables (zero secrets) | 67 |
 | `bke-worker/scripts/package-desktop-worker.sh` | Verifies `BKE_EXECUTION_V2_ASYMMETRIC_ENABLED=false`, `BKE_REQUIRE_ASYMMETRIC_V2=false`, `BKE_REMOTE_BROKER_ENABLED=false` during packaging (`53` files) | 305 |
 | `bke-worker/docs/f3-security-audit.md` | F3-00 structured 10-finding adversarial audit of F2 | 43 |
