@@ -183,19 +183,49 @@ export class SandboxBrokerHttpServer {
         return;
       }
       if (path === '/v1/enrollment/status') {
+        const workerId = String(body.workerId ?? body.worker_id ?? '');
+        const deviceId =
+          typeof (body.deviceId ?? body.device_id) === 'string'
+            ? String(body.deviceId ?? body.device_id)
+            : undefined;
+        const installationId =
+          typeof (body.installationId ?? body.installation_id) === 'string'
+            ? String(body.installationId ?? body.installation_id)
+            : undefined;
+        const repository =
+          typeof body.repository === 'string' ? body.repository : undefined;
+        const rawGen = body.enrollmentGeneration ?? body.min_generation ?? body.enrollment_generation;
+        const enrollmentGeneration = typeof rawGen === 'number' ? rawGen : undefined;
+        const nonce = typeof body.nonce === 'string' ? body.nonce : '';
+        if (nonce) {
+          const signedStatus = await this.broker.getSignedDeviceStatus({
+            workerId,
+            deviceId,
+            installationId,
+            repository,
+            enrollmentGeneration,
+            nonce,
+          });
+          sendJson(res, 200, {
+            ok: true,
+            status: signedStatus.payload.status,
+            revoked: signedStatus.payload.revoked,
+            code: signedStatus.payload.code,
+            enrollment_generation: signedStatus.payload.actual_enrollment_generation,
+            signed_status: signedStatus,
+          });
+          return;
+        }
         const status = await this.enrollment.inspectDeviceStatus({
-          workerId: String(body.workerId ?? body.worker_id ?? ''),
-          deviceId:
-            typeof (body.deviceId ?? body.device_id) === 'string'
-              ? String(body.deviceId ?? body.device_id)
-              : undefined,
-          enrollmentGeneration:
-            typeof (body.enrollmentGeneration ?? body.min_generation ?? body.enrollment_generation) === 'number'
-              ? Number(body.enrollmentGeneration ?? body.min_generation ?? body.enrollment_generation)
-              : undefined,
+          workerId,
+          deviceId,
+          installationId,
+          repository,
+          enrollmentGeneration,
         });
         sendJson(res, 200, {
           ok: true,
+          status: status.status,
           revoked: status.revoked,
           code: status.code ?? null,
           enrollment_generation: status.device?.enrollment_generation ?? null,
@@ -213,8 +243,20 @@ export class SandboxBrokerHttpServer {
         return;
       }
       if (path === '/v1/broker/token-status') {
-        const revoked = await this.broker.isTokenRevoked(String(body.token ?? ''));
-        sendJson(res, 200, { ok: true, revoked });
+        const token = String(body.token ?? '');
+        const nonce = typeof body.nonce === 'string' ? body.nonce : '';
+        if (nonce) {
+          const signedTokenStatus = await this.broker.getSignedTokenStatus({ token, nonce });
+          sendJson(res, 200, {
+            ok: true,
+            status: signedTokenStatus.payload.status,
+            revoked: signedTokenStatus.payload.revoked,
+            signed_status: signedTokenStatus,
+          });
+          return;
+        }
+        const revoked = await this.broker.isTokenRevoked(token);
+        sendJson(res, 200, { ok: true, status: revoked ? 'REVOKED' : 'ACTIVE', revoked });
         return;
       }
       if (path === '/v1/broker/revoke-token') {

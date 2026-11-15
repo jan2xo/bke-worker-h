@@ -172,6 +172,8 @@ package_bundle() {
     || fail "BKE_REQUIRE_ASYMMETRIC_V2 must default false in deploy template"
   grep -q '^BKE_REMOTE_BROKER_ENABLED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
     || fail "BKE_REMOTE_BROKER_ENABLED must default false in deploy template"
+  grep -q '^BKE_SERVER_MEDIATED_CAS_ENABLED=false$' "$ROOT_DIR/deploy/desktop-controller.env.example" \
+    || fail "BKE_SERVER_MEDIATED_CAS_ENABLED must default false in deploy template"
 
   local out_parent
   out_parent="$(dirname -- "$OUT_DIR")"

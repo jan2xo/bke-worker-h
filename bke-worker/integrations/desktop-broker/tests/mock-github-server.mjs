@@ -127,19 +127,33 @@ export async function startMockGitHubServer(initialConfig = {}) {
 
     // 3. Installation repositories: GET /installation/repositories
     if (req.method === 'GET' && p === '/installation/repositories') {
+      const authHeader = req.headers.authorization ?? '';
+      const bearerTok = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
+      const issued = bearerTok ? state.issuedTokens.get(bearerTok) : undefined;
+      const reposWithTokPerms = state.repos.map((repo) => {
+        if (!issued) return repo;
+        const pms = {
+          ...issued.permissions,
+          pull: issued.permissions.contents === 'read' || issued.permissions.contents === 'write',
+          push: issued.permissions.contents === 'write',
+        };
+        if (repo.permissions?.admin) pms.admin = true;
+        if (repo.permissions?.maintain) pms.maintain = true;
+        return { ...repo, permissions: pms };
+      });
       const page = Number(u.searchParams.get('page') ?? '1');
       if (state.incompleteRepoPagination) {
-        return send(200, { total_count: state.repos.length + 3, repositories: state.repos.slice(0, 1) });
+        return send(200, { total_count: reposWithTokPerms.length + 3, repositories: reposWithTokPerms.slice(0, 1) });
       }
-      if (state.repos.length > 1 && page === 1) {
+      if (reposWithTokPerms.length > 1 && page === 1) {
         return send(
           200,
-          { total_count: state.repos.length, repositories: [state.repos[0]] },
+          { total_count: reposWithTokPerms.length, repositories: [reposWithTokPerms[0]] },
           { Link: `<${baseUrl}/installation/repositories?per_page=100&page=2>; rel="next"` },
         );
       }
-      const slice = state.repos.length > 1 ? state.repos.slice(1) : state.repos;
-      return send(200, { total_count: state.repos.length, repositories: slice });
+      const slice = reposWithTokPerms.length > 1 ? reposWithTokPerms.slice(1) : reposWithTokPerms;
+      return send(200, { total_count: reposWithTokPerms.length, repositories: slice });
     }
 
     // 4. Open PRs per repository: GET /repos/:owner/:repo/pulls

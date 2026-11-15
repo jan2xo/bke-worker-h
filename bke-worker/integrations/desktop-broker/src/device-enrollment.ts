@@ -668,24 +668,45 @@ export class DeviceEnrollmentRegistry {
   async inspectDeviceStatus(info: {
     workerId: string;
     deviceId?: string;
+    installationId?: string;
+    repository?: string;
     enrollmentGeneration?: number;
-  }): Promise<{ revoked: boolean; code?: string; device: EnrolledDeviceRecord | null }> {
+  }): Promise<{
+    status: 'ACTIVE' | 'REVOKED';
+    revoked: boolean;
+    code?: string;
+    device: EnrolledDeviceRecord | null;
+  }> {
     const state = await this.withFileLock(() => this.readStateOrCreate());
     const devId = info.deviceId ?? state.workerToDeviceId[info.workerId];
-    if (!devId) return { revoked: true, code: 'EXEC_REQ_DEVICE_UNKNOWN', device: null };
+    if (!devId) return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_DEVICE_UNKNOWN', device: null };
     const dev = state.devices[devId] ?? null;
     if (!dev || dev.revocation_state !== 'ACTIVE' || state.revokedDeviceIds.includes(devId)) {
-      return { revoked: true, code: 'EXEC_REQ_DEVICE_REVOKED', device: dev };
+      return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_DEVICE_REVOKED', device: dev };
     }
     if (dev.worker_id !== info.workerId) {
-      return { revoked: true, code: 'EXEC_REQ_WORKER_MISMATCH', device: dev };
+      return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_WORKER_MISMATCH', device: dev };
+    }
+    if (typeof info.installationId === 'string' && info.installationId && dev.installation_id !== info.installationId) {
+      return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_INSTALLATION_MISMATCH', device: dev };
+    }
+    if (
+      typeof info.repository === 'string' &&
+      info.repository &&
+      !dev.authorized_repository_scope.some((r) => r.toLowerCase() === info.repository!.toLowerCase())
+    ) {
+      return { status: 'REVOKED', revoked: true, code: 'DEVICE_REPOSITORY_UNAUTHORIZED', device: dev };
     }
     if (
       typeof info.enrollmentGeneration === 'number' &&
-      info.enrollmentGeneration < dev.enrollment_generation
+      info.enrollmentGeneration !== dev.enrollment_generation
     ) {
-      return { revoked: true, code: 'EXEC_REQ_ENROLLMENT_STALE', device: dev };
+      const code =
+        info.enrollmentGeneration < dev.enrollment_generation
+          ? 'EXEC_REQ_ENROLLMENT_STALE'
+          : 'EXEC_REQ_ENROLLMENT_GENERATION_MISMATCH';
+      return { status: 'REVOKED', revoked: true, code, device: dev };
     }
-    return { revoked: false, device: structuredClone(dev) };
+    return { status: 'ACTIVE', revoked: false, device: structuredClone(dev) };
   }
 }

@@ -582,6 +582,42 @@ test('F3-04 / F3-08: Multi-process sandbox E2E (Broker -> V2 Daemon -> Native IP
     assert.equal(finalStatus.confirmedTurnCount, 2);
     assert.equal(finalStatus.conversationId, 'conv-f3-mp-01');
     assert.equal(finalStatus.tokenLifecycle.realBrokerTransportConnected, true);
+    assert.equal(finalStatus.tokenLifecycle.requestedContentsLevel, 'read');
+    assert.equal(finalStatus.mediatedCasEnabled, true);
+    assert.equal(finalStatus.desktopWriteTokenForbidden, true);
+    assert.equal(finalStatus.revocationAuthorityConfigured, true);
+
+    // P0-03 Verification: Broker refuses desktop contents:write token requests across HTTP too
+    const forbiddenMintRes = await fetch(`${brokerUrl}/v1/broker/tokens`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repository: REPO,
+        repository_id: REPO_ID,
+        installation_id: INSTALL_ID,
+        worker_id: WORKER,
+        requested_permissions: { contents: 'write', pull_requests: 'read', checks: 'read' },
+        device_assertion: deviceSigner.signDeviceAssertion({
+          worker_id: WORKER,
+          device_id: DEVICE_ID,
+          installation_id: INSTALL_ID,
+          enrollment_generation: 1,
+          purpose: 'MINT_SCOPED_TOKEN',
+          repository: REPO,
+        }),
+      }),
+    });
+    assert.equal(forbiddenMintRes.status, 403);
+    const forbiddenMintBody = await forbiddenMintRes.json();
+    assert.equal(forbiddenMintBody.code, 'BROKER_DESKTOP_WRITE_TOKEN_FORBIDDEN');
+
+    const auditBody = await (await fetch(`${brokerUrl}/v1/broker/audit`)).json();
+    assert.equal(auditBody.ok, true);
+    const auditOps = new Set(auditBody.events.map((e) => e.operation));
+    assert.ok(auditOps.has('MINT_SCOPED_TOKEN'));
+    assert.ok(auditOps.has('MEDIATED_COMMIT_PRE_SEND_FENCE'));
+    assert.ok(auditOps.has('MEDIATED_CONSUME_SEND_CLAIM'));
+    assert.ok(auditOps.has('MEDIATED_RECONCILE_CONVERSATION'));
 
     // F3-08: Verify integrated F3 evidence maps cleanly across all 14 Command Center visible states
     const observedTags = new Set();

@@ -17,15 +17,22 @@ import { SandboxGitHubAppAdapter } from './github-app-adapter.js';
 import {
   BROKER_AUTHORIZED_CAPABILITY_V2,
   BROKER_PROTOCOL_VERSION_V2,
+  DEVICE_STATUS_DOMAIN,
   EXECUTION_V2_DOMAIN,
+  TOKEN_STATUS_DOMAIN,
   type BrokerAuditEvent,
   type BrokerSigningKeyEntry,
   type DeviceSignedAssertion,
+  type DeviceStatusPayload,
   type ExecutionAction,
   type ExecutionRequestEnvelopeV2,
   type ServerMediatedLedgerOpRequest,
+  type ServerMediatedLedgerOpResult,
   type SignedAdminApproval,
+  type SignedDeviceStatusResponse,
   type SignedExecutionRequestV2,
+  type SignedTokenStatusResponse,
+  type TokenStatusPayload,
 } from './types.js';
 
 const ENVELOPE_V2_KEYS = [
@@ -74,6 +81,14 @@ function serializeEnvelopeV2(env: ExecutionRequestEnvelopeV2): string {
   const ordered: Record<string, unknown> = {};
   for (const k of ENVELOPE_V2_KEYS) {
     ordered[k] = env[k];
+  }
+  return JSON.stringify(ordered);
+}
+
+function canonicalJson(value: Record<string, unknown>): string {
+  const ordered: Record<string, unknown> = {};
+  for (const k of Object.keys(value).sort()) {
+    ordered[k] = value[k];
   }
   return JSON.stringify(ordered);
 }
@@ -548,16 +563,18 @@ export class TrustedDesktopBroker {
       await this.atomicWrite(state);
     });
 
-    // Strict clamping: only contents/pull_requests/checks allowed; never admin/issues/actions
+    // Strict clamping: desktop workers may ONLY request read scopes (0 contents:write tokens!)
     const clamped: Record<string, 'read' | 'write'> = {};
     for (const [k, v] of Object.entries(params.requested_permissions)) {
       if (k !== 'contents' && k !== 'pull_requests' && k !== 'checks') {
         throw Error('BROKER_REQUESTED_PERMISSION_FORBIDDEN');
       }
-      if (k !== 'contents' && v !== 'read') {
-        throw Error('BROKER_REQUESTED_PERMISSION_FORBIDDEN');
+      if (v !== 'read') {
+        throw Error(
+          k === 'contents' ? 'BROKER_DESKTOP_WRITE_TOKEN_FORBIDDEN' : 'BROKER_REQUESTED_PERMISSION_FORBIDDEN',
+        );
       }
-      clamped[k] = v;
+      clamped[k] = 'read';
     }
     if (Object.keys(clamped).length === 0) {
       throw Error('BROKER_REQUESTED_PERMISSION_EMPTY');
@@ -601,7 +618,10 @@ export class TrustedDesktopBroker {
     worker_id: string;
     device_assertion: DeviceSignedAssertion;
     ledger_op: ServerMediatedLedgerOpRequest;
-  }): Promise<{ ok: true; status: 'COMMITTED' | 'ALREADY_EXISTS'; sha: string } | { ok: false; code: string }> {
+  }): Promise<ServerMediatedLedgerOpResult> {
+    if (!params.ledger_op || typeof params.ledger_op !== 'object' || Array.isArray(params.ledger_op)) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
+    }
     const device = await this.config.enrollmentRegistry.verifyDeviceAssertion(
       params.device_assertion,
       'SERVER_MEDIATED_LEDGER_OP',
@@ -609,9 +629,10 @@ export class TrustedDesktopBroker {
     );
     if (
       device.worker_id !== params.worker_id ||
-      device.installation_id !== params.ledger_op.installation_id
+      device.installation_id !== params.ledger_op.installation_id ||
+      (params.ledger_op.worker_id && params.ledger_op.worker_id !== params.worker_id)
     ) {
-      return { ok: false, code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }
     const nonce = params.device_assertion.payload.nonce;
     await this.withFileLock(async () => {
@@ -621,13 +642,16 @@ export class TrustedDesktopBroker {
       await this.atomicWrite(state);
     });
 
-    const res = await this.config.githubAppAdapter.executeServerMediatedLedgerOp(params.ledger_op);
+    const res = await this.config.githubAppAdapter.executeServerMediatedLedgerOp({
+      ...params.ledger_op,
+      worker_id: device.worker_id,
+    });
     await this.withFileLock(async () => {
       const state = await this.readOrInitState();
       this.appendAudit(state, {
         operation: `MEDIATED_${params.ledger_op.operation}`,
         outcome: res.ok ? 'ALLOWED' : 'DENIED',
-        code: res.ok ? res.status : res.code,
+        code: res.ok ? res.status : (res.code ?? res.status),
         worker_id: device.worker_id,
         device_id: device.device_id,
         repository: params.ledger_op.repository,
@@ -636,6 +660,95 @@ export class TrustedDesktopBroker {
       await this.atomicWrite(state);
     });
     return res;
+  }
+
+  async getSignedDeviceStatus(params: {
+    workerId: string;
+    deviceId?: string;
+    installationId?: string;
+    repository?: string;
+    enrollmentGeneration?: number;
+    nonce: string;
+  }): Promise<SignedDeviceStatusResponse> {
+    if (typeof params.nonce !== 'string' || !/^[A-Za-z0-9._:-]{8,128}$/.test(params.nonce)) {
+      throw Error('BROKER_STATUS_NONCE_INVALID');
+    }
+    const status = await this.config.enrollmentRegistry.inspectDeviceStatus({
+      workerId: params.workerId,
+      deviceId: params.deviceId,
+      installationId: params.installationId,
+      repository: params.repository,
+      enrollmentGeneration: params.enrollmentGeneration,
+    });
+    const now = this.nowMs();
+    const payload: DeviceStatusPayload = {
+      version: 1,
+      broker_issuer: this.config.brokerIssuer,
+      worker_id: params.workerId,
+      device_id: params.deviceId ?? status.device?.device_id ?? '',
+      installation_id: params.installationId ?? status.device?.installation_id ?? '',
+      repository: params.repository ?? status.device?.authorized_repository_scope[0] ?? '',
+      enrollment_generation:
+        typeof params.enrollmentGeneration === 'number' ? params.enrollmentGeneration : null,
+      actual_enrollment_generation: status.device?.enrollment_generation ?? null,
+      status: status.status,
+      revoked: status.revoked,
+      code: status.code ?? null,
+      nonce: params.nonce,
+      issued_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 30_000).toISOString(),
+    };
+    return this.withFileLock(async () => {
+      const state = await this.readOrInitState();
+      const signingKey = state.signingKeys.find((k) => k.role === 'EXECUTION' && k.status === 'ACTIVE');
+      if (!signingKey) throw Error('BROKER_SIGNING_KEY_MISSING');
+      const signingInput = DEVICE_STATUS_DOMAIN + canonicalJson(payload as unknown as Record<string, unknown>);
+      const sig = cryptoSign(null, Buffer.from(signingInput, 'utf8'), signingKey.private_key_pem);
+      return {
+        payload,
+        signature_alg: 'Ed25519',
+        key_id: signingKey.key_id,
+        signature_b64url: sig.toString('base64url'),
+      };
+    });
+  }
+
+  async getSignedTokenStatus(params: {
+    token: string;
+    nonce: string;
+  }): Promise<SignedTokenStatusResponse> {
+    if (typeof params.nonce !== 'string' || !/^[A-Za-z0-9._:-]{8,128}$/.test(params.nonce)) {
+      throw Error('BROKER_STATUS_NONCE_INVALID');
+    }
+    if (typeof params.token !== 'string' || !params.token.trim()) {
+      throw Error('BROKER_TOKEN_INVALID');
+    }
+    const tokenSha = createHash('sha256').update(params.token, 'utf8').digest('hex');
+    const revoked = await this.isTokenRevoked(params.token);
+    const now = this.nowMs();
+    const payload: TokenStatusPayload = {
+      version: 1,
+      broker_issuer: this.config.brokerIssuer,
+      token_sha256: tokenSha,
+      status: revoked ? 'REVOKED' : 'ACTIVE',
+      revoked,
+      nonce: params.nonce,
+      issued_at: new Date(now).toISOString(),
+      expires_at: new Date(now + 30_000).toISOString(),
+    };
+    return this.withFileLock(async () => {
+      const state = await this.readOrInitState();
+      const signingKey = state.signingKeys.find((k) => k.role === 'EXECUTION' && k.status === 'ACTIVE');
+      if (!signingKey) throw Error('BROKER_SIGNING_KEY_MISSING');
+      const signingInput = TOKEN_STATUS_DOMAIN + canonicalJson(payload as unknown as Record<string, unknown>);
+      const sig = cryptoSign(null, Buffer.from(signingInput, 'utf8'), signingKey.private_key_pem);
+      return {
+        payload,
+        signature_alg: 'Ed25519',
+        key_id: signingKey.key_id,
+        signature_b64url: sig.toString('base64url'),
+      };
+    });
   }
 
   async revokeIssuedToken(token: string): Promise<void> {

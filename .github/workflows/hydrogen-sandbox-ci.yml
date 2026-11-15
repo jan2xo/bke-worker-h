@@ -73,6 +73,7 @@ jobs:
           grep -q '^BKE_EXECUTION_V2_ASYMMETRIC_ENABLED=false$' deploy/desktop-controller.env.example
           grep -q '^BKE_REQUIRE_ASYMMETRIC_V2=false$' deploy/desktop-controller.env.example
           grep -q '^BKE_REMOTE_BROKER_ENABLED=false$' deploy/desktop-controller.env.example
+          grep -q '^BKE_SERVER_MEDIATED_CAS_ENABLED=false$' deploy/desktop-controller.env.example
           bash scripts/package-desktop-worker.sh package --out "$RUNNER_TEMP/desktop-pkg"
           node -e '
             const fs = require("node:fs");

@@ -14,8 +14,11 @@ export const ENROLLMENT_CHALLENGE_DOMAIN = 'BKE_DESKTOP_ENROLLMENT_V1\n';
 export const DEVICE_POP_DOMAIN = 'BKE_DESKTOP_DEVICE_POP_V1\n';
 export const ADMIN_ASSERTION_DOMAIN = 'BKE_ADMIN_APPROVAL_V1\n';
 export const EXECUTION_V2_DOMAIN = 'BKE_EXECUTION_REQUEST_V2\n';
+export const DEVICE_STATUS_DOMAIN = 'BKE_DEVICE_STATUS_V1\n';
+export const TOKEN_STATUS_DOMAIN = 'BKE_TOKEN_STATUS_V1\n';
 
 export type RevocationState = 'ACTIVE' | 'REVOKED' | 'LOST';
+export type DeviceRevocationStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
 
 export type ExecutionAction =
   | 'PREPARE'
@@ -141,6 +144,48 @@ export interface SignedExecutionRequestV2 {
   signature_b64url: string;
 }
 
+export interface DeviceStatusPayload {
+  version: 1;
+  broker_issuer: string;
+  worker_id: string;
+  device_id: string;
+  installation_id: string;
+  repository: string;
+  enrollment_generation: number | null;
+  actual_enrollment_generation: number | null;
+  status: 'ACTIVE' | 'REVOKED';
+  revoked: boolean;
+  code: string | null;
+  nonce: string;
+  issued_at: string;
+  expires_at: string;
+}
+
+export interface SignedDeviceStatusResponse {
+  payload: DeviceStatusPayload;
+  signature_alg: 'Ed25519';
+  key_id: string;
+  signature_b64url: string;
+}
+
+export interface TokenStatusPayload {
+  version: 1;
+  broker_issuer: string;
+  token_sha256: string;
+  status: 'ACTIVE' | 'REVOKED';
+  revoked: boolean;
+  nonce: string;
+  issued_at: string;
+  expires_at: string;
+}
+
+export interface SignedTokenStatusResponse {
+  payload: TokenStatusPayload;
+  signature_alg: 'Ed25519';
+  key_id: string;
+  signature_b64url: string;
+}
+
 export interface BrokerSigningKeyEntry {
   key_id: string;
   role: 'EXECUTION' | 'HALT';
@@ -174,11 +219,21 @@ export interface ServerMediatedLedgerOpRequest {
   repository: string;
   repository_id: number;
   installation_id: string;
+  worker_id?: string;
   pr_number: number;
   head_sha: string;
   attempt_id: string;
   ref_name: string;
+  turn_ref_name?: string;
   expected_parent_sha?: string;
+  is_continuation?: boolean;
   commit_message: string;
   tree_sha: string;
+}
+
+export interface ServerMediatedLedgerOpResult {
+  ok: boolean;
+  status: 'COMMITTED' | 'ALREADY_EXISTS' | 'CONFLICT' | 'UNCERTAIN';
+  sha?: string | null;
+  code?: string;
 }

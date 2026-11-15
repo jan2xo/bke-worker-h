@@ -18,11 +18,17 @@ async function main() {
     privateKeyPem: cfg.devicePrivateKeyPem,
   });
 
+  const executionPublicKeys = new Map(Object.entries(cfg.executionPublicKeys));
   const brokerClient = new SandboxHttpTokenBrokerClient({
     brokerBaseUrl: cfg.brokerBaseUrl,
     deviceId: cfg.deviceId,
     enrollmentGeneration: cfg.enrollmentGeneration,
     deviceSigner,
+    brokerPublicKeysById: executionPublicKeys,
+    expectedBrokerIssuer: cfg.expectedBrokerIssuer,
+    repository: cfg.repository,
+    installationId: cfg.installationId,
+    workerId: cfg.workerId,
   });
 
   const tokenLifecycle = new ManagedTokenProvider(
@@ -31,7 +37,7 @@ async function main() {
       repositoryId: cfg.repositoryId,
       installationId: cfg.installationId,
       workerId: cfg.workerId,
-      allowedPermissions: { contents: 'write', pull_requests: 'read', checks: 'read' },
+      allowedPermissions: { contents: 'read', pull_requests: 'read', checks: 'read' },
       maxTransientRetries: cfg.maxTransientRetries ?? 2,
       retryDelayMs: cfg.retryDelayMs ?? 15,
       trustedRealBrokerApiAvailable: true,
@@ -62,36 +68,26 @@ async function main() {
       executionEnvelopeEnabled: true,
       asymmetricV2Enabled: true,
       requireAsymmetricV2: true,
+      mediatedCasEnabled: true,
       expectedRepositoryId: cfg.repositoryId,
       expectedInstallationId: cfg.installationId,
-      executionPublicKeysById: new Map(Object.entries(cfg.executionPublicKeys)),
+      executionPublicKeysById: executionPublicKeys,
       remoteHaltPublicKeysById: new Map(Object.entries(cfg.haltPublicKeys)),
       allowRemoteSignedHalt: true,
       expectedAudience: cfg.expectedAudience,
       expectedBrokerIssuer: cfg.expectedBrokerIssuer,
       expectedDeviceId: cfg.deviceId,
+      expectedEnrollmentGeneration: cfg.enrollmentGeneration,
       minEnrollmentGeneration: cfg.enrollmentGeneration,
       brokerAvailable: true,
       brokerEndpointConfigured: true,
       githubApiBaseUrl: cfg.githubApiBaseUrl,
-      deviceRevocationChecker: async ({ workerId, deviceId, enrollmentGeneration }) => {
-        const res = await fetch(`${cfg.brokerBaseUrl}/v1/enrollment/status`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            worker_id: workerId,
-            device_id: deviceId,
-            min_generation: enrollmentGeneration,
-          }),
-        });
-        if (!res.ok) return { revoked: true, code: 'BROKER_REVOCATION_CHECK_FAILED' };
-        const body = await res.json();
-        return { revoked: Boolean(body.revoked), code: body.code ?? undefined };
-      },
+      deviceRevocationChecker: (info) => brokerClient.checkDeviceRevocation(info),
     },
     {
       tokenProvider: tokenLifecycle.asTokenProvider(),
       tokenLifecycle,
+      mediatedLedgerClient: brokerClient,
     },
   );
 

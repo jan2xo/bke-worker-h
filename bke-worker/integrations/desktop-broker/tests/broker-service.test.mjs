@@ -213,7 +213,9 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
       expectedAudience: AUDIENCE,
       expectedBrokerIssuer: ISSUER,
       expectedDeviceId: DEVICE,
+      expectedEnrollmentGeneration: 1,
       minEnrollmentGeneration: 1,
+      deviceRevocationChecker: (info) => registry.inspectDeviceStatus(info),
       allowRemoteHalt: true,
       provider: authProvider,
       nowMs: () => clock.now,
@@ -264,7 +266,9 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
       expectedAudience: 'bke-desktop-controller:other/repo:worker-f1',
       expectedBrokerIssuer: ISSUER,
       expectedDeviceId: DEVICE,
+      expectedEnrollmentGeneration: 1,
       minEnrollmentGeneration: 1,
+      deviceRevocationChecker: (info) => registry.inspectDeviceStatus(info),
       allowRemoteHalt: true,
       provider: authProvider,
       nowMs: () => clock.now,
@@ -373,6 +377,26 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
           }),
         }),
       /BROKER_REQUESTED_PERMISSION_FORBIDDEN/,
+    );
+    await assert.rejects(
+      () =>
+        broker.mintScopedToken({
+          repository: REPO,
+          repository_id: REPO_ID,
+          installation_id: INSTALL_ID,
+          worker_id: WORKER,
+          requested_permissions: { contents: 'write', pull_requests: 'read', checks: 'read' },
+          device_assertion: signer.signDeviceAssertion({
+            worker_id: WORKER,
+            device_id: DEVICE,
+            installation_id: INSTALL_ID,
+            enrollment_generation: 1,
+            purpose: 'MINT_SCOPED_TOKEN',
+            repository: REPO,
+            nowMs: clock.now,
+          }),
+        }),
+      /BROKER_DESKTOP_WRITE_TOKEN_FORBIDDEN/,
     );
     await assert.rejects(
       () =>
@@ -553,6 +577,11 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
         deviceId: DEVICE,
         enrollmentGeneration: 1,
         deviceSigner: signer,
+        brokerPublicKeysById: new Map(Object.entries(pubKeys.executionPublicKeys)),
+        expectedBrokerIssuer: ISSUER,
+        repository: REPO,
+        installationId: INSTALL_ID,
+        workerId: WORKER,
         nowMs: () => clock.now,
       });
       const provider = new ManagedTokenProvider(
@@ -561,7 +590,7 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
           repositoryId: REPO_ID,
           installationId: INSTALL_ID,
           workerId: WORKER,
-          allowedPermissions: { contents: 'write', pull_requests: 'read', checks: 'read' },
+          allowedPermissions: { contents: 'read', pull_requests: 'read', checks: 'read' },
           nowMs: () => clock.now,
         },
         client,
@@ -669,7 +698,9 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
       expectedAudience: AUDIENCE,
       expectedBrokerIssuer: ISSUER,
       expectedDeviceId: DEVICE,
+      expectedEnrollmentGeneration: 1,
       minEnrollmentGeneration: 1,
+      deviceRevocationChecker: (info) => registry.inspectDeviceStatus(info),
       allowRemoteHalt: true,
       provider: authProvider,
       nowMs: () => clock.now,

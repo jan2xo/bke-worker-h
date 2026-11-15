@@ -56,6 +56,40 @@ export type LedgerHttpFetch = (
   init: RequestInit & {signal: AbortSignal},
 ) => Promise<LedgerHttpResponse>;
 
+export type ServerMediatedLedgerOpKind =
+  | 'COMMIT_PRE_SEND_FENCE'
+  | 'CONSUME_SEND_CLAIM'
+  | 'RECONCILE_CONVERSATION'
+  | 'MARK_DELIVERY_UNCERTAIN';
+
+export interface ServerMediatedLedgerOpInput {
+  operation: ServerMediatedLedgerOpKind;
+  repository: string;
+  repositoryId: number;
+  installationId: string;
+  workerId: string;
+  prNumber: number;
+  headSha: string;
+  attemptId: string;
+  refName: string;
+  turnRefName?: string;
+  expectedParentSha?: string;
+  isContinuation?: boolean;
+  commitMessage: string;
+  treeSha: string;
+}
+
+export interface ServerMediatedLedgerOpResult {
+  ok: boolean;
+  status: 'COMMITTED' | 'ALREADY_EXISTS' | 'CONFLICT' | 'UNCERTAIN';
+  sha?: string | null;
+  code?: string;
+}
+
+export interface ServerMediatedLedgerClient {
+  executeLedgerOp(input: ServerMediatedLedgerOpInput): Promise<ServerMediatedLedgerOpResult>;
+}
+
 export interface GitHubF1LedgerConfig {
   repository: string;
   prNumber: number;
@@ -70,6 +104,10 @@ export interface GitHubF1LedgerConfig {
   baseApiUrl?: string;
   timeoutMs?: number;
   nowIso?: () => string;
+  mediatedLedgerClient?: ServerMediatedLedgerClient;
+  expectedRepositoryId?: number;
+  expectedInstallationId?: string;
+  forbidDesktopWriteToken?: boolean;
 }
 
 export interface ConversationTurnRecord {
@@ -208,6 +246,17 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
     if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 10_000) {
       throw Error('GITHUB_DEADLINE_INVALID');
     }
+    if (config.mediatedLedgerClient) {
+      if (
+        typeof config.expectedRepositoryId !== 'number' ||
+        !Number.isSafeInteger(config.expectedRepositoryId) ||
+        config.expectedRepositoryId <= 0 ||
+        typeof config.expectedInstallationId !== 'string' ||
+        !/^[0-9]{1,20}$/.test(config.expectedInstallationId)
+      ) {
+        throw Error('GITHUB_MEDIATED_SCOPE_INVALID');
+      }
+    }
     this.timeoutMs = timeout;
     this.nowIsoFn = config.nowIso ?? (() => new Date().toISOString());
     this.baseApi = (config.baseApiUrl ?? 'https://api.github.com').replace(/\/+$/, '');
@@ -312,7 +361,26 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
       return (item as Record<string, unknown>).full_name === this.config.repository;
     });
     if (!match) throw Error('GITHUB_INSTALLATION_SCOPE_MISMATCH');
-    const perms = asRecord((match as Record<string, unknown>).permissions, 'GITHUB_INSTALLATION_SCOPE_MISMATCH');
+    const matchObj = match as Record<string, unknown>;
+    if (
+      typeof this.config.expectedRepositoryId === 'number' &&
+      matchObj.id !== this.config.expectedRepositoryId
+    ) {
+      throw Error('GITHUB_INSTALLATION_SCOPE_MISMATCH');
+    }
+    const perms = asRecord(matchObj.permissions, 'GITHUB_INSTALLATION_SCOPE_MISMATCH');
+    if (perms.admin === true || perms.maintain === true || perms.administration === 'write') {
+      throw Error('GITHUB_INSTALLATION_OVERPRIVILEGED');
+    }
+    if (this.config.mediatedLedgerClient || this.config.forbidDesktopWriteToken) {
+      if (perms.contents === 'write' || perms.push === true) {
+        throw Error('GITHUB_DESKTOP_WRITE_TOKEN_FORBIDDEN');
+      }
+      if (perms.contents !== 'read' && perms.pull !== true) {
+        throw Error('GITHUB_INSTALLATION_READ_SCOPE_MISSING');
+      }
+      return;
+    }
     if (perms.push !== true && perms.contents !== 'write') {
       throw Error('GITHUB_INSTALLATION_WRITE_SCOPE_MISSING');
     }
@@ -746,6 +814,31 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
         generation: fence.generation,
         committedAt: fence.committedAt,
       };
+      const ref = this.fenceRef(fence.attemptId);
+      if (this.config.mediatedLedgerClient) {
+        const mediatedRes = await this.config.mediatedLedgerClient.executeLedgerOp({
+          operation: 'COMMIT_PRE_SEND_FENCE',
+          repository: this.config.repository,
+          repositoryId: this.config.expectedRepositoryId!,
+          installationId: this.config.expectedInstallationId!,
+          workerId: this.config.workerId,
+          prNumber: this.config.prNumber,
+          headSha: fence.headSha,
+          attemptId: fence.attemptId,
+          refName: ref,
+          expectedParentSha: fence.headSha,
+          commitMessage: JSON.stringify(commitPayload),
+          treeSha,
+        });
+        if (mediatedRes.ok && mediatedRes.status === 'COMMITTED' && typeof mediatedRes.sha === 'string' && SHA40.test(mediatedRes.sha)) {
+          this.activeFence = {...fence, commitSha: mediatedRes.sha};
+          return {status: 'COMMITTED', commitSha: mediatedRes.sha};
+        }
+        if (mediatedRes.status === 'CONFLICT') {
+          return {status: 'CONFLICT', commitSha: null};
+        }
+        return {status: 'UNCERTAIN', commitSha: null};
+      }
       const commitRes = await this.request('POST', `${this.repoRoot}/git/commits`, {
         message: JSON.stringify(commitPayload),
         tree: treeSha,
@@ -753,7 +846,6 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
       });
       if (commitRes.status !== 201) return {status: 'UNCERTAIN', commitSha: null};
       const commitSha = asSha(asRecord(commitRes.data).sha);
-      const ref = this.fenceRef(fence.attemptId);
       const refRes = await this.request('POST', `${this.repoRoot}/git/refs`, {
         ref,
         sha: commitSha,
@@ -857,8 +949,52 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
       return {status: 'CONFLICT', commitSha: null};
     }
 
-    this.claimPostAttempted = true;
     const ref = this.claimRef(claim.attemptId);
+    if (this.config.mediatedLedgerClient) {
+      let treeSha: string;
+      try {
+        treeSha = await this.readTreeSha(claim.headSha);
+      } catch {
+        return {status: 'CONFLICT', commitSha: null};
+      }
+      this.claimPostAttempted = true;
+      try {
+        const mediatedRes = await this.config.mediatedLedgerClient.executeLedgerOp({
+          operation: 'CONSUME_SEND_CLAIM',
+          repository: this.config.repository,
+          repositoryId: this.config.expectedRepositoryId!,
+          installationId: this.config.expectedInstallationId!,
+          workerId: this.config.workerId,
+          prNumber: this.config.prNumber,
+          headSha: claim.headSha,
+          attemptId: claim.attemptId,
+          refName: ref,
+          commitMessage: JSON.stringify({
+            bkeEvent: 'SEND_CLAIM',
+            version: 1,
+            claimId: claim.claimId,
+            fenceId: claim.fenceId,
+            fenceCommitSha: claim.fenceCommitSha,
+            attemptId: claim.attemptId,
+            workerId: claim.workerId,
+            headSha: claim.headSha,
+          }),
+          treeSha,
+        });
+        if (mediatedRes.ok && mediatedRes.status === 'COMMITTED' && mediatedRes.sha === claim.headSha) {
+          this.activeClaim = {...claim, commitSha: claim.headSha};
+          return {status: 'COMMITTED', commitSha: claim.headSha};
+        }
+        if (mediatedRes.status === 'CONFLICT') {
+          return {status: 'CONFLICT', commitSha: null};
+        }
+        return {status: 'UNCERTAIN', commitSha: null};
+      } catch {
+        return {status: 'UNCERTAIN', commitSha: null};
+      }
+    }
+
+    this.claimPostAttempted = true;
     try {
       const refRes = await this.request('POST', `${this.repoRoot}/git/refs`, {
         ref,
@@ -974,6 +1110,38 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
         turns: existing ? [...existing.turns, turnRecord] : [turnRecord],
       };
       const parents = auth.conversationTipSha ? [auth.conversationTipSha] : [turnRecord.headSha];
+      const convRef = this.conversationRef();
+      const turnRef = this.turnRef(turnRecord.attemptId);
+      if (this.config.mediatedLedgerClient) {
+        const mediatedRes = await this.config.mediatedLedgerClient.executeLedgerOp({
+          operation: 'RECONCILE_CONVERSATION',
+          repository: this.config.repository,
+          repositoryId: this.config.expectedRepositoryId!,
+          installationId: this.config.expectedInstallationId!,
+          workerId: this.config.workerId,
+          prNumber: this.config.prNumber,
+          headSha: turnRecord.headSha,
+          attemptId: turnRecord.attemptId,
+          refName: convRef,
+          turnRefName: turnRef,
+          expectedParentSha: auth.conversationTipSha ?? undefined,
+          isContinuation: !isFirstTurn,
+          commitMessage: JSON.stringify(nextPayload),
+          treeSha,
+        });
+        if (
+          mediatedRes.ok &&
+          (mediatedRes.status === 'COMMITTED' || mediatedRes.status === 'ALREADY_EXISTS') &&
+          typeof mediatedRes.sha === 'string' &&
+          SHA40.test(mediatedRes.sha)
+        ) {
+          auth.conversationTipSha = mediatedRes.sha;
+          auth.conversationLedger = nextPayload;
+          this.reconciledTurnConfirmed = true;
+          return {ok: true, commitSha: mediatedRes.sha};
+        }
+        return {ok: false, commitSha: null};
+      }
       const commitRes = await this.request('POST', `${this.repoRoot}/git/commits`, {
         message: JSON.stringify(nextPayload),
         tree: treeSha,
@@ -981,7 +1149,6 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
       });
       if (commitRes.status !== 201) return {ok: false, commitSha: null};
       const commitSha = asSha(asRecord(commitRes.data).sha);
-      const convRef = this.conversationRef();
       if (isFirstTurn) {
         const refRes = await this.request('POST', `${this.repoRoot}/git/refs`, {
           ref: convRef,
@@ -998,7 +1165,6 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
       }
 
       // Record per-turn immutable ref as well
-      const turnRef = this.turnRef(turnRecord.attemptId);
       const turnRefRes = await this.request('POST', `${this.repoRoot}/git/refs`, {
         ref: turnRef,
         sha: commitSha,
@@ -1101,6 +1267,27 @@ export class GitHubF1Ledger implements FirstMessageLedgerPort, ContinuationLedge
     const attemptId = this.activeAttemptId;
     if (!attemptId) return;
     try {
+      if (this.config.mediatedLedgerClient) {
+        const treeSha = await this.readTreeSha(this.config.headSha).catch(() => this.config.headSha);
+        await this.config.mediatedLedgerClient.executeLedgerOp({
+          operation: 'MARK_DELIVERY_UNCERTAIN',
+          repository: this.config.repository,
+          repositoryId: this.config.expectedRepositoryId!,
+          installationId: this.config.expectedInstallationId!,
+          workerId: this.config.workerId,
+          prNumber: this.config.prNumber,
+          headSha: this.config.headSha,
+          attemptId,
+          refName: this.uncertainRef(attemptId),
+          commitMessage: JSON.stringify({
+            bkeEvent: 'DELIVERY_UNCERTAIN',
+            attemptId,
+            headSha: this.config.headSha,
+          }),
+          treeSha,
+        });
+        return;
+      }
       await this.request('POST', `${this.repoRoot}/git/refs`, {
         ref: this.uncertainRef(attemptId),
         sha: this.config.headSha,

@@ -124,7 +124,7 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
         repository_id: REPO_ID,
         installation_id: INSTALL_ID,
         worker_id: WORKER,
-        requested_permissions: { contents: 'write', pull_requests: 'read', checks: 'read' },
+        requested_permissions: { contents: 'read', pull_requests: 'read', checks: 'read' },
         device_assertion: signer.signDeviceAssertion({
           worker_id: WORKER,
           device_id: DEVICE,
@@ -135,6 +135,39 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
           nowMs: now,
         }),
       });
+
+    const mediatedLedgerClient = {
+      async executeLedgerOp(op) {
+        return broker.executeServerMediatedLedgerOp({
+          worker_id: op.workerId,
+          device_assertion: signer.signDeviceAssertion({
+            worker_id: op.workerId,
+            device_id: DEVICE,
+            installation_id: op.installationId,
+            enrollment_generation: 1,
+            purpose: 'SERVER_MEDIATED_LEDGER_OP',
+            repository: op.repository,
+            nowMs: now,
+          }),
+          ledger_op: {
+            operation: op.operation,
+            repository: op.repository,
+            repository_id: op.repositoryId,
+            installation_id: op.installationId,
+            worker_id: op.workerId,
+            pr_number: op.prNumber,
+            head_sha: op.headSha,
+            attempt_id: op.attemptId,
+            ref_name: op.refName,
+            turn_ref_name: op.turnRefName,
+            expected_parent_sha: op.expectedParentSha,
+            is_continuation: op.isContinuation,
+            commit_message: op.commitMessage,
+            tree_sha: op.treeSha,
+          },
+        });
+      },
+    };
 
     // Scenario 1 & 2 & 14: Broker crash before/after signing & delivery replay after restart
     mockGh.setTicket(REPO, HEAD_A, WORKER, 'att-c1', now + 180_000);
@@ -230,6 +263,10 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
           targetTabId: 1,
           baseApiUrl: mockGh.baseUrl,
           nowIso: () => new Date(now).toISOString(),
+          mediatedLedgerClient,
+          expectedRepositoryId: REPO_ID,
+          expectedInstallationId: INSTALL_ID,
+          forbidDesktopWriteToken: true,
         },
         httpFetch,
         async () => (await tokenMint()).token,
@@ -532,7 +569,9 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
       expectedAudience: AUDIENCE,
       expectedBrokerIssuer: ISSUER,
       expectedDeviceId: DEVICE,
+      expectedEnrollmentGeneration: 1,
       minEnrollmentGeneration: 1,
+      deviceRevocationChecker: (info) => registry.inspectDeviceStatus(info),
       provider: authProv,
       nowMs: () => now,
     });
@@ -581,7 +620,9 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
       expectedAudience: AUDIENCE,
       expectedBrokerIssuer: ISSUER,
       expectedDeviceId: DEVICE,
+      expectedEnrollmentGeneration: 1,
       minEnrollmentGeneration: 1,
+      deviceRevocationChecker: (info) => registry.inspectDeviceStatus(info),
       provider: authProv,
       nowMs: () => now + 600_000,
     });

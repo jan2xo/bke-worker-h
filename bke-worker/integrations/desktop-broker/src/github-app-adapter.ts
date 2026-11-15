@@ -10,12 +10,14 @@
  *   `CONSUME_SEND_CLAIM`, `RECONCILE_CONVERSATION`, `MARK_DELIVERY_UNCERTAIN`) and refuses
  *   arbitrary GitHub API proxying.
  */
-import { createPrivateKey, createPublicKey, generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
-import type { ServerMediatedLedgerOpRequest } from './types.js';
+import { createPrivateKey, generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
+import type { ServerMediatedLedgerOpRequest, ServerMediatedLedgerOpResult } from './types.js';
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA40_RE = /^[a-f0-9]{40}$/;
 const WORKER_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const ATTEMPT_RE = /^[a-z0-9][a-z0-9-]{0,95}$/;
+const IDENTIFIER_RE = /^[A-Za-z0-9_-]{8,128}$/;
 const INSTALL_RE = /^[0-9]{1,20}$/;
 
 function base64UrlJson(obj: Record<string, unknown>): string {
@@ -498,73 +500,440 @@ export class SandboxGitHubAppAdapter {
     };
   }
 
+  private async verifyMediatedPrAndNoUncertain(
+    token: string,
+    req: ServerMediatedLedgerOpRequest,
+    allowUncertainRefs = false,
+  ): Promise<{ ok: true } | { ok: false; code: string }> {
+    const prRes = await this.httpJson(
+      'GET',
+      `${this.apiBaseUrl}/repos/${req.repository}/pulls/${req.pr_number}`,
+      token,
+    );
+    if (prRes.status !== 200) {
+      return { ok: false, code: 'BROKER_LEDGER_PR_NOT_FOUND' };
+    }
+    const prObj = prRes.data as Record<string, unknown>;
+    if (prObj.state !== 'open') {
+      return { ok: false, code: 'BROKER_LEDGER_PR_NOT_OPEN' };
+    }
+    const liveHead = String((prObj.head as Record<string, unknown> | undefined)?.sha ?? '');
+    if (liveHead !== req.head_sha) {
+      return { ok: false, code: 'BROKER_LEDGER_HEAD_STALE' };
+    }
+    if (req.worker_id) {
+      const prOwners = Array.isArray(prObj.labels)
+        ? prObj.labels
+            .map((l) => String((l as Record<string, unknown>)?.name ?? ''))
+            .filter((n) => n.startsWith('bke-worker:'))
+            .map((n) => n.slice('bke-worker:'.length))
+        : [];
+      if (prOwners.length !== 1 || prOwners[0] !== req.worker_id) {
+        return { ok: false, code: 'BROKER_LEDGER_WORKER_CONFLICT' };
+      }
+
+      // Confirm worker is not simultaneously assigned to multiple open PRs in this repo
+      const listRes = await this.httpJson(
+        'GET',
+        `${this.apiBaseUrl}/repos/${req.repository}/pulls?state=open&per_page=100`,
+        token,
+      );
+      if (listRes.status !== 200 || !Array.isArray(listRes.data)) {
+        return { ok: false, code: 'BROKER_LEDGER_PULLS_UNAVAILABLE' };
+      }
+      let assignedCount = 0;
+      for (const rawPr of listRes.data) {
+        const p = rawPr as Record<string, unknown>;
+        const owners = Array.isArray(p.labels)
+          ? p.labels
+              .map((l) => String((l as Record<string, unknown>)?.name ?? ''))
+              .filter((n) => n.startsWith('bke-worker:'))
+              .map((n) => n.slice('bke-worker:'.length))
+          : [];
+        if (owners.includes(req.worker_id)) {
+          assignedCount += 1;
+        }
+      }
+      if (assignedCount !== 1) {
+        return { ok: false, code: 'BROKER_LEDGER_MULTI_PR_CONFLICT' };
+      }
+    }
+
+    if (!allowUncertainRefs) {
+      const refsRes = await this.httpJson(
+        'GET',
+        `${this.apiBaseUrl}/repos/${req.repository}/git/matching-refs/bke/?per_page=100`,
+        token,
+      );
+      if (refsRes.status !== 200 || !Array.isArray(refsRes.data)) {
+        return { ok: false, code: 'BROKER_LEDGER_REFS_UNAVAILABLE' };
+      }
+      const uncertainPrefix = `refs/bke/uncertain/${req.pr_number}/`;
+      for (const rawRef of refsRes.data) {
+        const refName = String((rawRef as Record<string, unknown>)?.ref ?? '');
+        if (refName.startsWith(uncertainPrefix)) {
+          return { ok: false, code: 'BROKER_DELIVERY_UNCERTAIN_QUARANTINED' };
+        }
+      }
+    }
+    return { ok: true };
+  }
+
+  private async verifyPinnedTicketForClaim(
+    token: string,
+    req: ServerMediatedLedgerOpRequest,
+  ): Promise<{ ok: true } | { ok: false; code: string }> {
+    if (!req.worker_id) {
+      return { ok: true };
+    }
+    const crRes = await this.httpJson(
+      'GET',
+      `${this.apiBaseUrl}/repos/${req.repository}/commits/${req.head_sha}/check-runs?per_page=100`,
+      token,
+    );
+    if (crRes.status !== 200) {
+      return { ok: false, code: 'BROKER_CHECK_RUNS_READ_FAILED' };
+    }
+    const crBody = crRes.data as Record<string, unknown>;
+    const runs = Array.isArray(crBody.check_runs) ? crBody.check_runs : [];
+    const validRuns = runs.filter((raw) => {
+      const c = raw as Record<string, unknown>;
+      const app = c.app as Record<string, unknown> | undefined;
+      const ext = typeof c.external_id === 'string' ? c.external_id : '';
+      return (
+        c.name === 'bke-ticket' &&
+        c.head_sha === req.head_sha &&
+        c.status === 'completed' &&
+        c.conclusion === 'success' &&
+        app?.id === this.appId &&
+        app?.slug === this.appSlug &&
+        ext.startsWith(`bke-ticket:v1:${req.worker_id}:${req.attempt_id}:`)
+      );
+    });
+    if (validRuns.length !== 1) {
+      return { ok: false, code: 'BROKER_TICKET_INVALID_OR_AMBIGUOUS' };
+    }
+    const expEpoch = Number(String((validRuns[0] as Record<string, unknown>).external_id).split(':')[4]);
+    if (!Number.isFinite(expEpoch) || expEpoch * 1000 <= this.nowMs()) {
+      return { ok: false, code: 'BROKER_TICKET_EXPIRED' };
+    }
+    return { ok: true };
+  }
+
+  private validateConversationPayloadMessage(req: ServerMediatedLedgerOpRequest): boolean {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(req.commit_message);
+    } catch {
+      return false;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const obj = parsed as Record<string, unknown>;
+    if (
+      obj.bkeEvent !== 'CONVERSATION_LEDGER_V1' ||
+      obj.version !== 1 ||
+      obj.repository !== req.repository ||
+      obj.prNumber !== req.pr_number ||
+      typeof obj.conversationId !== 'string' ||
+      !IDENTIFIER_RE.test(obj.conversationId) ||
+      !Array.isArray(obj.turns) ||
+      obj.turns.length < 1
+    ) {
+      return false;
+    }
+    if (req.worker_id && obj.workerId !== req.worker_id) {
+      return false;
+    }
+    return true;
+  }
+
   /**
-   * Server-Mediated GitHub CAS Prototype (F3-03 Audit Area D):
-   * Avoids exposing `contents: write` installation tokens to the desktop worker by
-   * permitting ONLY four fixed CAS ref operations, never arbitrary GitHub API paths.
+   * Server-Mediated GitHub CAS (F4 P0-03):
+   * Eliminates `contents: write` installation tokens from the desktop worker by
+   * permitting ONLY four strict CAS ref operations, never arbitrary GitHub API paths.
    */
   async executeServerMediatedLedgerOp(
     req: ServerMediatedLedgerOpRequest,
-  ): Promise<{ ok: true; status: 'COMMITTED' | 'ALREADY_EXISTS'; sha: string } | { ok: false; code: string }> {
-    const allowedPrefixByOp: Record<ServerMediatedLedgerOpRequest['operation'], string> = {
-      COMMIT_PRE_SEND_FENCE: `refs/bke/fences/${req.pr_number}/`,
-      CONSUME_SEND_CLAIM: `refs/bke/claims/${req.pr_number}/`,
+  ): Promise<ServerMediatedLedgerOpResult> {
+    const rawReq = req as unknown as Record<string, unknown>;
+    if (rawReq.force === true || rawReq.force_update === true) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_ARBITRARY_PROXY_FORBIDDEN' };
+    }
+    if (
+      !REPO_RE.test(req.repository) ||
+      !INSTALL_RE.test(req.installation_id) ||
+      !Number.isSafeInteger(req.repository_id) ||
+      req.repository_id <= 0 ||
+      !Number.isSafeInteger(req.pr_number) ||
+      req.pr_number < 1 ||
+      !ATTEMPT_RE.test(req.attempt_id)
+    ) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_ARBITRARY_PROXY_FORBIDDEN' };
+    }
+    const exactRefByOp: Record<ServerMediatedLedgerOpRequest['operation'], string> = {
+      COMMIT_PRE_SEND_FENCE: `refs/bke/fences/${req.pr_number}/${req.attempt_id}`,
+      CONSUME_SEND_CLAIM: `refs/bke/claims/${req.pr_number}/${req.attempt_id}`,
       RECONCILE_CONVERSATION: `refs/bke/conversations/${req.pr_number}`,
-      MARK_DELIVERY_UNCERTAIN: `refs/bke/uncertain/${req.pr_number}/`,
+      MARK_DELIVERY_UNCERTAIN: `refs/bke/uncertain/${req.pr_number}/${req.attempt_id}`,
     };
-    const requiredPrefix = allowedPrefixByOp[req.operation];
-    if (!requiredPrefix || !req.ref_name.startsWith(requiredPrefix) || req.ref_name.includes('..')) {
-      return { ok: false, code: 'BROKER_ARBITRARY_PROXY_FORBIDDEN' };
+    const expectedExactRef = exactRefByOp[req.operation];
+    if (!expectedExactRef || req.ref_name !== expectedExactRef || req.ref_name.includes('..')) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_ARBITRARY_PROXY_FORBIDDEN' };
+    }
+    if (req.turn_ref_name && req.turn_ref_name !== `refs/bke/turns/${req.pr_number}/${req.attempt_id}`) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_ARBITRARY_PROXY_FORBIDDEN' };
     }
     if (!SHA40_RE.test(req.head_sha) || !SHA40_RE.test(req.tree_sha)) {
-      return { ok: false, code: 'BROKER_LEDGER_SHA_INVALID' };
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_SHA_INVALID' };
+    }
+    if (req.expected_parent_sha !== undefined && !SHA40_RE.test(req.expected_parent_sha)) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_SHA_INVALID' };
     }
 
-    const minted = await this.resolveInstallationAndMintToken({
-      repository: req.repository,
-      expectedRepositoryId: req.repository_id,
-      expectedInstallationId: req.installation_id,
-      permissions: { contents: 'write' },
-    });
-
-    const commitRes = await this.httpJson(
-      'POST',
-      `${this.apiBaseUrl}/repos/${req.repository}/git/commits`,
-      minted.token,
-      {
-        message: req.commit_message,
-        tree: req.tree_sha,
-        parents: req.expected_parent_sha ? [req.expected_parent_sha] : [req.head_sha],
-      },
-    );
-    if (commitRes.status !== 201) {
-      return { ok: false, code: `BROKER_LEDGER_COMMIT_FAILED_${commitRes.status}` };
-    }
-    const createdCommitSha = String((commitRes.data as Record<string, unknown>)?.sha ?? '');
-    if (!SHA40_RE.test(createdCommitSha)) {
-      return { ok: false, code: 'BROKER_LEDGER_COMMIT_SHA_INVALID' };
+    let minted;
+    try {
+      minted = await this.resolveInstallationAndMintToken({
+        repository: req.repository,
+        expectedRepositoryId: req.repository_id,
+        expectedInstallationId: req.installation_id,
+        permissions: { contents: 'write', pull_requests: 'read', checks: 'read' },
+      });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : 'BROKER_GITHUB_TRANSPORT_UNAVAILABLE';
+      return { ok: false, status: 'UNCERTAIN', code };
     }
 
-    if (req.operation === 'RECONCILE_CONVERSATION' && req.expected_parent_sha) {
-      const refSuffix = req.ref_name.replace(/^refs\//, '');
-      const patchRes = await this.httpJson(
-        'PATCH',
-        `${this.apiBaseUrl}/repos/${req.repository}/git/refs/${refSuffix}`,
+    try {
+      if (req.operation === 'MARK_DELIVERY_UNCERTAIN') {
+        const postRef = await this.httpJson(
+          'POST',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
+          minted.token,
+          { ref: req.ref_name, sha: req.head_sha },
+        );
+        if (postRef.status === 201) {
+          const obj = postRef.data as Record<string, unknown>;
+          const refObj = obj.object as Record<string, unknown> | undefined;
+          if (obj.ref === req.ref_name && refObj?.sha === req.head_sha) {
+            return { ok: true, status: 'COMMITTED', sha: req.head_sha };
+          }
+          return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_READBACK_MISMATCH' };
+        }
+        if (postRef.status === 422) {
+          const getRef = await this.httpJson(
+            'GET',
+            `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${req.ref_name.slice('refs/'.length)}`,
+            minted.token,
+          );
+          const getObj = getRef.data as Record<string, unknown>;
+          const refSha = (getObj.object as Record<string, unknown> | undefined)?.sha;
+          if (getRef.status === 200 && refSha === req.head_sha) {
+            return { ok: true, status: 'ALREADY_EXISTS', sha: req.head_sha };
+          }
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_UNCERTAIN_CONFLICT' };
+        }
+        return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_REF_FAILED_${postRef.status}` };
+      }
+
+      if (req.operation === 'COMMIT_PRE_SEND_FENCE') {
+        const prCheck = await this.verifyMediatedPrAndNoUncertain(minted.token, req);
+        if (!prCheck.ok) {
+          return { ok: false, status: 'CONFLICT', code: prCheck.code };
+        }
+        const commitRes = await this.httpJson(
+          'POST',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/commits`,
+          minted.token,
+          {
+            message: req.commit_message,
+            tree: req.tree_sha,
+            parents: [req.head_sha],
+          },
+        );
+        if (commitRes.status !== 201) {
+          return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_COMMIT_FAILED_${commitRes.status}` };
+        }
+        const commitSha = String((commitRes.data as Record<string, unknown>)?.sha ?? '');
+        if (!SHA40_RE.test(commitSha)) {
+          return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_COMMIT_SHA_INVALID' };
+        }
+        const postRef = await this.httpJson(
+          'POST',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
+          minted.token,
+          { ref: req.ref_name, sha: commitSha },
+        );
+        if (postRef.status === 422) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_CONFLICT' };
+        }
+        if (postRef.status !== 201) {
+          return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_REF_FAILED_${postRef.status}` };
+        }
+        const readBackRef = await this.httpJson(
+          'GET',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${req.ref_name.slice('refs/'.length)}`,
+          minted.token,
+        );
+        const readSha = (readBackRef.data as Record<string, unknown> | undefined)?.object as Record<string, unknown> | undefined;
+        if (readBackRef.status !== 200 || readSha?.sha !== commitSha) {
+          return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_READBACK_MISMATCH' };
+        }
+        return { ok: true, status: 'COMMITTED', sha: commitSha };
+      }
+
+      if (req.operation === 'CONSUME_SEND_CLAIM') {
+        const prCheck = await this.verifyMediatedPrAndNoUncertain(minted.token, req);
+        if (!prCheck.ok) {
+          return { ok: false, status: 'CONFLICT', code: prCheck.code };
+        }
+        const fenceRef = `bke/fences/${req.pr_number}/${req.attempt_id}`;
+        const fenceRes = await this.httpJson(
+          'GET',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${fenceRef}`,
+          minted.token,
+        );
+        if (fenceRes.status !== 200) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_MISSING' };
+        }
+        const ticketCheck = await this.verifyPinnedTicketForClaim(minted.token, req);
+        if (!ticketCheck.ok) {
+          return { ok: false, status: 'CONFLICT', code: ticketCheck.code };
+        }
+        // Claim ref MUST point directly to req.head_sha (no intermediate commit creation)
+        const postRef = await this.httpJson(
+          'POST',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
+          minted.token,
+          { ref: req.ref_name, sha: req.head_sha },
+        );
+        if (postRef.status === 422) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_CLAIM_CONFLICT' };
+        }
+        if (postRef.status !== 201) {
+          return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_REF_FAILED_${postRef.status}` };
+        }
+        const postObj = postRef.data as Record<string, unknown>;
+        const postSha = (postObj.object as Record<string, unknown> | undefined)?.sha;
+        if (postObj.ref !== req.ref_name || postSha !== req.head_sha) {
+          return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_READBACK_MISMATCH' };
+        }
+        const readBackRef = await this.httpJson(
+          'GET',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${req.ref_name.slice('refs/'.length)}`,
+          minted.token,
+        );
+        const readSha = ((readBackRef.data as Record<string, unknown> | undefined)?.object as Record<string, unknown> | undefined)?.sha;
+        if (readBackRef.status !== 200 || readSha !== req.head_sha) {
+          return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_READBACK_MISMATCH' };
+        }
+        const postPr = await this.verifyMediatedPrAndNoUncertain(minted.token, req);
+        if (!postPr.ok) {
+          return { ok: false, status: 'UNCERTAIN', code: postPr.code };
+        }
+        return { ok: true, status: 'COMMITTED', sha: req.head_sha };
+      }
+
+      // RECONCILE_CONVERSATION
+      if (!this.validateConversationPayloadMessage(req)) {
+        return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_CONVERSATION_PAYLOAD_INVALID' };
+      }
+      const prCheck = await this.verifyMediatedPrAndNoUncertain(minted.token, req);
+      if (!prCheck.ok) {
+        return { ok: false, status: 'CONFLICT', code: prCheck.code };
+      }
+
+      const convRefSuffix = req.ref_name.slice('refs/'.length);
+      const liveConvRes = await this.httpJson(
+        'GET',
+        `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${convRefSuffix}`,
         minted.token,
-        { sha: createdCommitSha, force: false },
       );
-      if (patchRes.status === 200) return { ok: true, status: 'COMMITTED', sha: createdCommitSha };
-      return { ok: false, code: `BROKER_LEDGER_PATCH_CONFLICT_${patchRes.status}` };
-    }
+      const isContinuation = req.is_continuation === true || Boolean(req.expected_parent_sha);
+      if (isContinuation) {
+        const liveTip = ((liveConvRes.data as Record<string, unknown> | undefined)?.object as Record<string, unknown> | undefined)?.sha;
+        if (liveConvRes.status !== 200 || !req.expected_parent_sha || liveTip !== req.expected_parent_sha) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_CONVERSATION_CAS_CONFLICT' };
+        }
+      } else if (liveConvRes.status !== 404) {
+        return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_CONVERSATION_ALREADY_EXISTS' };
+      }
 
-    const postRef = await this.httpJson(
-      'POST',
-      `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
-      minted.token,
-      { ref: req.ref_name, sha: createdCommitSha },
-    );
-    if (postRef.status === 201) return { ok: true, status: 'COMMITTED', sha: createdCommitSha };
-    if (postRef.status === 422) return { ok: true, status: 'ALREADY_EXISTS', sha: createdCommitSha };
-    return { ok: false, code: `BROKER_LEDGER_REF_FAILED_${postRef.status}` };
+      const commitRes = await this.httpJson(
+        'POST',
+        `${this.apiBaseUrl}/repos/${req.repository}/git/commits`,
+        minted.token,
+        {
+          message: req.commit_message,
+          tree: req.tree_sha,
+          parents: req.expected_parent_sha ? [req.expected_parent_sha] : [req.head_sha],
+        },
+      );
+      if (commitRes.status !== 201) {
+        return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_COMMIT_FAILED_${commitRes.status}` };
+      }
+      const createdCommitSha = String((commitRes.data as Record<string, unknown>)?.sha ?? '');
+      if (!SHA40_RE.test(createdCommitSha)) {
+        return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_COMMIT_SHA_INVALID' };
+      }
+
+      if (isContinuation) {
+        const patchRes = await this.httpJson(
+          'PATCH',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/refs/${convRefSuffix}`,
+          minted.token,
+          { sha: createdCommitSha, force: false },
+        );
+        if (patchRes.status !== 200) {
+          return { ok: false, status: 'CONFLICT', code: `BROKER_LEDGER_PATCH_CONFLICT_${patchRes.status}` };
+        }
+      } else {
+        const postRef = await this.httpJson(
+          'POST',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
+          minted.token,
+          { ref: req.ref_name, sha: createdCommitSha },
+        );
+        if (postRef.status === 422) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_CONVERSATION_CAS_CONFLICT' };
+        }
+        if (postRef.status !== 201) {
+          return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_REF_FAILED_${postRef.status}` };
+        }
+      }
+
+      const turnRefName = req.turn_ref_name ?? `refs/bke/turns/${req.pr_number}/${req.attempt_id}`;
+      const turnPost = await this.httpJson(
+        'POST',
+        `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
+        minted.token,
+        { ref: turnRefName, sha: createdCommitSha },
+      );
+      if (turnPost.status === 422) {
+        return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_TURN_CONFLICT' };
+      }
+      if (turnPost.status !== 201) {
+        return { ok: false, status: 'UNCERTAIN', code: `BROKER_LEDGER_TURN_REF_FAILED_${turnPost.status}` };
+      }
+
+      const rbConv = await this.httpJson(
+        'GET',
+        `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${convRefSuffix}`,
+        minted.token,
+      );
+      const rbTurn = await this.httpJson(
+        'GET',
+        `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${turnRefName.slice('refs/'.length)}`,
+        minted.token,
+      );
+      const rbConvSha = ((rbConv.data as Record<string, unknown> | undefined)?.object as Record<string, unknown> | undefined)?.sha;
+      const rbTurnSha = ((rbTurn.data as Record<string, unknown> | undefined)?.object as Record<string, unknown> | undefined)?.sha;
+      if (rbConv.status !== 200 || rbTurn.status !== 200 || rbConvSha !== createdCommitSha || rbTurnSha !== createdCommitSha) {
+        return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_READBACK_MISMATCH' };
+      }
+      return { ok: true, status: 'COMMITTED', sha: createdCommitSha };
+    } catch (err) {
+      const code = err instanceof Error ? err.message : 'BROKER_GITHUB_TRANSPORT_UNAVAILABLE';
+      return { ok: false, status: 'UNCERTAIN', code };
+    }
   }
 }

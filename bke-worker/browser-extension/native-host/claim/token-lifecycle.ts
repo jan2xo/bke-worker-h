@@ -58,9 +58,14 @@ export interface IssuedScopedToken {
   expiresAtMs: number;
 }
 
+export type TokenRevocationStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
+
 export interface TokenBrokerClient {
   readonly kind: 'MOCK_BROKER' | 'REMOTE_OWNER_CERTIFIED_BROKER';
   issueToken(request: TokenBrokerRequest): Promise<IssuedScopedToken>;
+  checkTokenStatus?(
+    token: string,
+  ): Promise<TokenRevocationStatus | { status: TokenRevocationStatus; code?: string }> | TokenRevocationStatus | { status: TokenRevocationStatus; code?: string };
   isRevoked?(token: string): Promise<boolean> | boolean;
 }
 
@@ -74,6 +79,7 @@ export interface TokenLifecycleStatus {
   hasCachedToken: boolean;
   expiresAtMs: number | null;
   revoked: boolean;
+  requestedContentsLevel?: PermissionAccessLevel;
   lastRecoveryClassification?: 'NONE' | 'RECOVERED_TRANSIENT' | 'BLOCKED_PERMANENT';
 }
 
@@ -158,6 +164,7 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
       hasCachedToken: valid,
       expiresAtMs: valid && this.cached ? this.cached.expiresAtMs : null,
       revoked: this.revokedFlag,
+      requestedContentsLevel: this.config.allowedPermissions.contents ?? 'none',
       lastRecoveryClassification: this.lastRecoveryClassification,
     };
   }
@@ -176,13 +183,40 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
     const now = this.nowMs();
     const minNeeded = Math.max(this.minValidRemainingMs, options.minTtlMs ?? 0);
 
-    // Check revocation hook on broker if supported before returning cached credential
-    if (this.cached && !this.revokedFlag && this.broker.isRevoked) {
-      const revoked = await Promise.resolve(this.broker.isRevoked(this.cached.token)).catch(() => false);
-      if (revoked) {
-        this.cached = null;
-        this.revokedFlag = true;
-        throw Error('TOKEN_REVOKED');
+    // Check revocation hook on broker fail-closed before returning cached credential
+    if (this.cached && !this.revokedFlag) {
+      if (this.broker.checkTokenStatus) {
+        let rawStatus: TokenRevocationStatus | { status: TokenRevocationStatus; code?: string };
+        try {
+          rawStatus = await Promise.resolve(this.broker.checkTokenStatus(this.cached.token));
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '';
+          throw Error(msg.startsWith('TOKEN_') ? msg : 'TOKEN_REVOCATION_UNAVAILABLE');
+        }
+        const status = typeof rawStatus === 'string' ? rawStatus : rawStatus?.status;
+        const code = typeof rawStatus === 'object' && rawStatus ? rawStatus.code : undefined;
+        if (status === 'REVOKED') {
+          this.cached = null;
+          this.revokedFlag = true;
+          throw Error('TOKEN_REVOKED');
+        }
+        if (status !== 'ACTIVE') {
+          throw Error(code && code.startsWith('TOKEN_') ? code : 'TOKEN_REVOCATION_UNAVAILABLE');
+        }
+      } else if (this.broker.isRevoked) {
+        let revoked: boolean;
+        try {
+          revoked = await Promise.resolve(this.broker.isRevoked(this.cached.token));
+        } catch {
+          throw Error('TOKEN_REVOCATION_UNAVAILABLE');
+        }
+        if (revoked !== false) {
+          this.cached = null;
+          this.revokedFlag = true;
+          throw Error('TOKEN_REVOKED');
+        }
+      } else if (this.broker.kind === 'REMOTE_OWNER_CERTIFIED_BROKER') {
+        throw Error('TOKEN_REVOCATION_CHECKER_MISSING');
       }
     }
 

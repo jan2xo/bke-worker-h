@@ -377,11 +377,25 @@ export interface PersistentReplayStore {
   recordNonDispatchDelivery?(deliveryId: string): Promise<void>;
 }
 
-export type DeviceRevocationChecker = (info: {
+export type DeviceRevocationState = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
+
+export interface DeviceRevocationCheckInput {
   workerId: string;
   deviceId?: string;
+  installationId?: string;
+  repository?: string;
   enrollmentGeneration?: number;
-}) => Promise<{ revoked: boolean; code?: string }> | { revoked: boolean; code?: string };
+}
+
+export interface DeviceRevocationCheckResult {
+  status?: DeviceRevocationState;
+  revoked: boolean;
+  code?: string;
+}
+
+export type DeviceRevocationChecker = (
+  info: DeviceRevocationCheckInput,
+) => Promise<DeviceRevocationCheckResult> | DeviceRevocationCheckResult;
 
 export interface ExecutionVerifierConfig {
   expectedRepositoryOwner: string;
@@ -393,7 +407,7 @@ export interface ExecutionVerifierConfig {
   hmacKeysById?: ReadonlyMap<string, string>;
   haltHmacKeysById?: ReadonlyMap<string, string>;
   allowRemoteHalt?: boolean;
-  // F3-00 / F3-04: Default-OFF asymmetric Ed25519 v2 protocol + downgrade protection
+  // F3-00 / F3-04 / F4 P0-01: Default-OFF asymmetric Ed25519 v2 protocol + strict downgrade elimination
   asymmetricV2Enabled?: boolean;
   requireAsymmetricV2?: boolean;
   publicKeysById?: ReadonlyMap<string, string>;
@@ -401,6 +415,7 @@ export interface ExecutionVerifierConfig {
   expectedAudience?: string;
   expectedBrokerIssuer?: string;
   expectedDeviceId?: string;
+  expectedEnrollmentGeneration?: number;
   minEnrollmentGeneration?: number;
   deviceRevocationChecker?: DeviceRevocationChecker;
   provider: GitHubAuthorityProvider;
@@ -415,6 +430,32 @@ export class ExecutionRequestVerifier {
   private mutexTail: Promise<void> = Promise.resolve();
 
   constructor(private readonly config: ExecutionVerifierConfig) {
+    if (config.requireAsymmetricV2 === true && config.asymmetricV2Enabled !== true) {
+      throw Error('EXEC_REQ_CONFIG_CONTRADICTORY');
+    }
+    if (config.asymmetricV2Enabled === true) {
+      if (config.requireAsymmetricV2 === false) {
+        throw Error('EXEC_REQ_CONFIG_DOWNGRADE_FORBIDDEN');
+      }
+      if (
+        (config.hmacKeysById && config.hmacKeysById.size > 0) ||
+        (config.haltHmacKeysById && config.haltHmacKeysById.size > 0)
+      ) {
+        throw Error('EXEC_REQ_CONFIG_MIXED_V1_V2_FORBIDDEN');
+      }
+      if (!config.publicKeysById || config.publicKeysById.size === 0) {
+        throw Error('EXEC_REQ_CONFIG_V2_KEYS_MISSING');
+      }
+      if (!config.expectedBrokerIssuer || !ISSUER_RE.test(config.expectedBrokerIssuer)) {
+        throw Error('EXEC_REQ_CONFIG_ISSUER_MISSING');
+      }
+      if (!config.expectedDeviceId || !DEVICE_ID_RE.test(config.expectedDeviceId)) {
+        throw Error('EXEC_REQ_CONFIG_DEVICE_ID_MISSING');
+      }
+      if (typeof config.deviceRevocationChecker !== 'function') {
+        throw Error('EXEC_REQ_REVOCATION_CHECKER_MISSING');
+      }
+    }
     this.nowMs = config.nowMs ?? (() => Date.now());
   }
 
@@ -509,11 +550,14 @@ export class ExecutionRequestVerifier {
     let env: AnyExecutionRequestEnvelope;
     let isV2 = false;
 
-    if (rawVersion === EXECUTION_REQUEST_PROTOCOL_VERSION_V2 && this.config.asymmetricV2Enabled === true) {
-      isV2 = true;
-      if (wrapper.signature_alg === 'HMAC-SHA256') {
-        return { ok: false, code: 'EXEC_REQ_ALGORITHM_MISMATCH' };
+    if (this.config.asymmetricV2Enabled === true) {
+      if (rawVersion === EXECUTION_REQUEST_PROTOCOL_VERSION || wrapper.signature_alg === 'HMAC-SHA256') {
+        return { ok: false, code: 'EXEC_REQ_DOWNGRADE_FORBIDDEN' };
       }
+      if (rawVersion !== EXECUTION_REQUEST_PROTOCOL_VERSION_V2) {
+        return { ok: false, code: 'EXEC_REQ_UNSUPPORTED_VERSION' };
+      }
+      isV2 = true;
       if (
         Object.keys(wrapper).sort().join(',') !== 'envelope,key_id,signature_alg,signature_b64url' ||
         wrapper.signature_alg !== 'Ed25519' ||
@@ -545,7 +589,7 @@ export class ExecutionRequestVerifier {
       if (!validSig) {
         return { ok: false, code: 'EXEC_REQ_SIGNATURE_INVALID' };
       }
-      if (this.config.expectedBrokerIssuer && envV2.broker_issuer !== this.config.expectedBrokerIssuer) {
+      if (envV2.broker_issuer !== this.config.expectedBrokerIssuer) {
         return { ok: false, code: 'EXEC_REQ_ISSUER_MISMATCH' };
       }
       const expectedAud =
@@ -554,8 +598,14 @@ export class ExecutionRequestVerifier {
       if (envV2.audience !== expectedAud) {
         return { ok: false, code: 'EXEC_REQ_AUDIENCE_MISMATCH' };
       }
-      if (this.config.expectedDeviceId && envV2.device_id !== this.config.expectedDeviceId) {
+      if (envV2.device_id !== this.config.expectedDeviceId) {
         return { ok: false, code: 'EXEC_REQ_DEVICE_MISMATCH' };
+      }
+      if (
+        typeof this.config.expectedEnrollmentGeneration === 'number' &&
+        envV2.enrollment_generation !== this.config.expectedEnrollmentGeneration
+      ) {
+        return { ok: false, code: 'EXEC_REQ_ENROLLMENT_GENERATION_MISMATCH' };
       }
       if (
         typeof this.config.minEnrollmentGeneration === 'number' &&
@@ -565,11 +615,11 @@ export class ExecutionRequestVerifier {
       }
       env = envV2;
     } else {
-      if (
-        this.config.requireAsymmetricV2 === true &&
-        rawVersion === EXECUTION_REQUEST_PROTOCOL_VERSION
-      ) {
+      if (this.config.requireAsymmetricV2 === true) {
         return { ok: false, code: 'EXEC_REQ_DOWNGRADE_FORBIDDEN' };
+      }
+      if (rawVersion === EXECUTION_REQUEST_PROTOCOL_VERSION_V2) {
+        return { ok: false, code: 'EXEC_REQ_UNSUPPORTED_VERSION' };
       }
       if (
         Object.keys(wrapper).sort().join(',') !== 'envelope,key_id,signature_alg,signature_hex' ||
@@ -623,13 +673,34 @@ export class ExecutionRequestVerifier {
       return { ok: false, code: 'EXEC_REQ_EXPIRED' };
     }
 
+    if (isV2 && !this.config.deviceRevocationChecker) {
+      return { ok: false, code: 'EXEC_REQ_REVOCATION_CHECKER_MISSING' };
+    }
     if (this.config.deviceRevocationChecker) {
-      const rev = await this.config.deviceRevocationChecker({
-        workerId: env.worker_id,
-        deviceId: isV2 ? (env as ExecutionRequestEnvelopeV2).device_id : undefined,
-        enrollmentGeneration: isV2 ? (env as ExecutionRequestEnvelopeV2).enrollment_generation : undefined,
-      });
-      if (rev.revoked) {
+      let rev: DeviceRevocationCheckResult;
+      try {
+        rev = await this.config.deviceRevocationChecker({
+          workerId: env.worker_id,
+          deviceId: isV2 ? (env as ExecutionRequestEnvelopeV2).device_id : undefined,
+          installationId: env.installation_identity,
+          repository: `${env.repository_owner}/${env.repository_name}`,
+          enrollmentGeneration: isV2 ? (env as ExecutionRequestEnvelopeV2).enrollment_generation : undefined,
+        });
+      } catch {
+        return { ok: false, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+      }
+      if (!rev || typeof rev !== 'object') {
+        return { ok: false, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+      }
+      if (rev.status !== undefined) {
+        if (rev.status === 'REVOKED') {
+          return { ok: false, code: rev.code || 'EXEC_REQ_DEVICE_REVOKED' };
+        }
+        if (rev.status !== 'ACTIVE') {
+          return { ok: false, code: rev.code || 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+        }
+      }
+      if (rev.revoked !== false) {
         return { ok: false, code: rev.code || 'EXEC_REQ_DEVICE_REVOKED' };
       }
     }

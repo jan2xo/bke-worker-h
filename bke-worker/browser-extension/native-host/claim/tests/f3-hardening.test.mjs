@@ -131,6 +131,28 @@ test('F3-00: Ed25519 V2 protocol verification, downgrade prevention, audience/de
   const haltKeys = genEd25519PemPair();
   let revoked = false;
 
+  // Mixed V1 HMAC keys + V2 asymmetricV2Enabled is strictly forbidden at construction (P0-01)
+  assert.throws(
+    () =>
+      new ExecutionRequestVerifier({
+        expectedRepositoryOwner: OWNER,
+        expectedRepositoryName: REPO_NAME,
+        expectedRepositoryId: REPO_ID,
+        expectedInstallationId: INSTALL_ID,
+        expectedWorkerId: WORKER,
+        pinnedApp: PINNED_APP,
+        hmacKeysById: new Map([['v1-hmac', HMAC_SECRET]]),
+        asymmetricV2Enabled: true,
+        requireAsymmetricV2: true,
+        publicKeysById: new Map([['ed-k1', execKeys.publicKeyPem]]),
+        expectedBrokerIssuer: BROKER_ISSUER,
+        expectedDeviceId: DEVICE_ID,
+        deviceRevocationChecker: () => ({ status: 'ACTIVE', revoked: false }),
+        provider: makeStubProvider(),
+      }),
+    /EXEC_REQ_CONFIG_MIXED_V1_V2_FORBIDDEN/,
+  );
+
   const verifier = new ExecutionRequestVerifier({
     expectedRepositoryOwner: OWNER,
     expectedRepositoryName: REPO_NAME,
@@ -138,7 +160,6 @@ test('F3-00: Ed25519 V2 protocol verification, downgrade prevention, audience/de
     expectedInstallationId: INSTALL_ID,
     expectedWorkerId: WORKER,
     pinnedApp: PINNED_APP,
-    hmacKeysById: new Map([['v1-hmac', HMAC_SECRET]]),
     asymmetricV2Enabled: true,
     requireAsymmetricV2: true,
     publicKeysById: new Map([['ed-k1', execKeys.publicKeyPem]]),
@@ -148,7 +169,11 @@ test('F3-00: Ed25519 V2 protocol verification, downgrade prevention, audience/de
     expectedAudience: AUDIENCE,
     expectedDeviceId: DEVICE_ID,
     minEnrollmentGeneration: 2,
-    deviceRevocationChecker: () => ({ revoked, code: revoked ? 'EXEC_REQ_DEVICE_REVOKED' : undefined }),
+    deviceRevocationChecker: () => ({
+      status: revoked ? 'REVOKED' : 'ACTIVE',
+      revoked,
+      code: revoked ? 'EXEC_REQ_DEVICE_REVOKED' : undefined,
+    }),
     provider: makeStubProvider(),
     nowMs: () => BASE_NOW,
   });
@@ -162,7 +187,7 @@ test('F3-00: Ed25519 V2 protocol verification, downgrade prevention, audience/de
   const tampered = { ...signedV2, envelope: { ...signedV2.envelope, pr_number: 999 } };
   assert.equal((await verifier.verifyAndAuthorize(tampered)).code, 'EXEC_REQ_SIGNATURE_INVALID');
 
-  // 3. Downgrade V1 HMAC rejected when requireAsymmetricV2=true
+  // 3. Downgrade V1 HMAC rejected when asymmetricV2Enabled=true
   const v1Req = signExecutionRequestHmac(
     {
       protocol_version: EXECUTION_REQUEST_PROTOCOL_VERSION,
@@ -193,7 +218,7 @@ test('F3-00: Ed25519 V2 protocol verification, downgrade prevention, audience/de
       key_id: 'ed-k1',
       signature_hex: 'a'.repeat(64),
     })).code,
-    'EXEC_REQ_ALGORITHM_MISMATCH',
+    'EXEC_REQ_DOWNGRADE_FORBIDDEN',
   );
 
   // 5. Audience / Issuer / Device / Enrollment generation mismatches fail closed
@@ -232,6 +257,9 @@ test('F3-00: Ed25519 V2 protocol verification, downgrade prevention, audience/de
     requireAsymmetricV2: true,
     publicKeysById: new Map([['ed-k1', execKeys.publicKeyPem]]),
     haltPublicKeysById: new Map([['ed-k1', execKeys.publicKeyPem]]),
+    expectedBrokerIssuer: BROKER_ISSUER,
+    expectedDeviceId: DEVICE_ID,
+    deviceRevocationChecker: () => ({ status: 'ACTIVE', revoked: false }),
     allowRemoteHalt: true,
     provider: makeStubProvider(),
     nowMs: () => BASE_NOW,
