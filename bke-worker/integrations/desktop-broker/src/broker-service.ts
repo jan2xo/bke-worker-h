@@ -56,10 +56,22 @@ const ENVELOPE_V2_KEYS = [
   'worker_id',
 ] as const;
 
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const WORKER_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const INSTALL_RE = /^[0-9]{1,20}$/;
+const DEVICE_ID_RE = /^[A-Za-z0-9._:-]{4,128}$/;
+
+function isValidRepoName(value: unknown): value is string {
+  if (typeof value !== 'string' || !REPO_RE.test(value)) return false;
+  const parts = value.split('/');
+  return parts.length === 2 && parts[0] !== '.' && parts[0] !== '..' && parts[1] !== '.' && parts[1] !== '..';
+}
+
 interface BrokerDurableState {
   version: 1;
   signingKeys: BrokerSigningKeyEntry[];
   usedNonces: string[];
+  usedStatusNonces?: string[];
   usedDeliveryIds: string[];
   revokedTokens: string[];
   auditSeq: number;
@@ -180,6 +192,7 @@ export class TrustedDesktopBroker {
             genEd25519Entry('broker-halt-k1', 'HALT', nowIso),
           ],
           usedNonces: [],
+          usedStatusNonces: [],
           usedDeliveryIds: [],
           revokedTokens: [],
           auditSeq: 0,
@@ -211,6 +224,9 @@ export class TrustedDesktopBroker {
     }
     if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.signingKeys)) {
       throw Error('BROKER_STATE_CORRUPT');
+    }
+    if (!Array.isArray(parsed.usedStatusNonces)) {
+      parsed.usedStatusNonces = [];
     }
     return parsed;
   }
@@ -544,6 +560,16 @@ export class TrustedDesktopBroker {
     issuedAtMs: number;
     expiresAtMs: number;
   }> {
+    if (!isValidRepoName(params.repository)) {
+      throw Error('BROKER_REPOSITORY_INVALID');
+    }
+    if (
+      typeof params.repository_id !== 'number' ||
+      !Number.isSafeInteger(params.repository_id) ||
+      params.repository_id <= 0
+    ) {
+      throw Error('BROKER_REPOSITORY_ID_INVALID');
+    }
     const device = await this.config.enrollmentRegistry.verifyDeviceAssertion(
       params.device_assertion,
       'MINT_SCOPED_TOKEN',
@@ -622,6 +648,9 @@ export class TrustedDesktopBroker {
     if (!params.ledger_op || typeof params.ledger_op !== 'object' || Array.isArray(params.ledger_op)) {
       return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
     }
+    if (!isValidRepoName(params.ledger_op.repository)) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
+    }
     const device = await this.config.enrollmentRegistry.verifyDeviceAssertion(
       params.device_assertion,
       'SERVER_MEDIATED_LEDGER_OP',
@@ -630,7 +659,7 @@ export class TrustedDesktopBroker {
     if (
       device.worker_id !== params.worker_id ||
       device.installation_id !== params.ledger_op.installation_id ||
-      (params.ledger_op.worker_id && params.ledger_op.worker_id !== params.worker_id)
+      (params.ledger_op.worker_id !== undefined && params.ledger_op.worker_id !== params.worker_id)
     ) {
       return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }
@@ -673,6 +702,9 @@ export class TrustedDesktopBroker {
     if (typeof params.nonce !== 'string' || !/^[A-Za-z0-9._:-]{8,128}$/.test(params.nonce)) {
       throw Error('BROKER_STATUS_NONCE_INVALID');
     }
+    if (typeof params.workerId !== 'string' || !WORKER_RE.test(params.workerId)) {
+      throw Error('BROKER_STATUS_PARAMS_INVALID');
+    }
     const status = await this.config.enrollmentRegistry.inspectDeviceStatus({
       workerId: params.workerId,
       deviceId: params.deviceId,
@@ -698,12 +730,39 @@ export class TrustedDesktopBroker {
       issued_at: new Date(now).toISOString(),
       expires_at: new Date(now + 30_000).toISOString(),
     };
+    if (payload.status === 'ACTIVE') {
+      if (
+        payload.revoked !== false ||
+        !status.device ||
+        !WORKER_RE.test(payload.worker_id) ||
+        payload.worker_id !== status.device.worker_id ||
+        !DEVICE_ID_RE.test(payload.device_id) ||
+        payload.device_id !== status.device.device_id ||
+        !INSTALL_RE.test(payload.installation_id) ||
+        payload.installation_id !== status.device.installation_id ||
+        !isValidRepoName(payload.repository) ||
+        !status.device.authorized_repository_scope.some((r) => r.toLowerCase() === payload.repository.toLowerCase()) ||
+        typeof payload.actual_enrollment_generation !== 'number' ||
+        !Number.isSafeInteger(payload.actual_enrollment_generation) ||
+        payload.actual_enrollment_generation < 1 ||
+        (payload.enrollment_generation !== null &&
+          payload.enrollment_generation !== payload.actual_enrollment_generation)
+      ) {
+        throw Error('BROKER_STATUS_PAYLOAD_INVALID');
+      }
+    }
     return this.withFileLock(async () => {
       const state = await this.readOrInitState();
+      const usedStatusNonces = state.usedStatusNonces ?? [];
+      if (usedStatusNonces.includes(params.nonce)) {
+        throw Error('BROKER_NONCE_REPLAYED');
+      }
+      state.usedStatusNonces = [...usedStatusNonces, params.nonce].slice(-2048);
       const signingKey = state.signingKeys.find((k) => k.role === 'EXECUTION' && k.status === 'ACTIVE');
       if (!signingKey) throw Error('BROKER_SIGNING_KEY_MISSING');
       const signingInput = DEVICE_STATUS_DOMAIN + canonicalJson(payload as unknown as Record<string, unknown>);
       const sig = cryptoSign(null, Buffer.from(signingInput, 'utf8'), signingKey.private_key_pem);
+      await this.atomicWrite(state);
       return {
         payload,
         signature_alg: 'Ed25519',
@@ -724,24 +783,30 @@ export class TrustedDesktopBroker {
       throw Error('BROKER_TOKEN_INVALID');
     }
     const tokenSha = createHash('sha256').update(params.token, 'utf8').digest('hex');
-    const revoked = await this.isTokenRevoked(params.token);
     const now = this.nowMs();
-    const payload: TokenStatusPayload = {
-      version: 1,
-      broker_issuer: this.config.brokerIssuer,
-      token_sha256: tokenSha,
-      status: revoked ? 'REVOKED' : 'ACTIVE',
-      revoked,
-      nonce: params.nonce,
-      issued_at: new Date(now).toISOString(),
-      expires_at: new Date(now + 30_000).toISOString(),
-    };
     return this.withFileLock(async () => {
       const state = await this.readOrInitState();
+      const usedStatusNonces = state.usedStatusNonces ?? [];
+      if (usedStatusNonces.includes(params.nonce)) {
+        throw Error('BROKER_NONCE_REPLAYED');
+      }
+      state.usedStatusNonces = [...usedStatusNonces, params.nonce].slice(-2048);
+      const revoked = state.revokedTokens.includes(tokenSha);
+      const payload: TokenStatusPayload = {
+        version: 1,
+        broker_issuer: this.config.brokerIssuer,
+        token_sha256: tokenSha,
+        status: revoked ? 'REVOKED' : 'ACTIVE',
+        revoked,
+        nonce: params.nonce,
+        issued_at: new Date(now).toISOString(),
+        expires_at: new Date(now + 30_000).toISOString(),
+      };
       const signingKey = state.signingKeys.find((k) => k.role === 'EXECUTION' && k.status === 'ACTIVE');
       if (!signingKey) throw Error('BROKER_SIGNING_KEY_MISSING');
       const signingInput = TOKEN_STATUS_DOMAIN + canonicalJson(payload as unknown as Record<string, unknown>);
       const sig = cryptoSign(null, Buffer.from(signingInput, 'utf8'), signingKey.private_key_pem);
+      await this.atomicWrite(state);
       return {
         payload,
         signature_alg: 'Ed25519',

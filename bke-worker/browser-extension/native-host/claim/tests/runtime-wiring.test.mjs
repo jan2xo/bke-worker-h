@@ -528,10 +528,12 @@ test('F4.1 distinct HTTP/error mapping for broker unavailable (503), device revo
             ok: true,
             token: {
               token: 'ghs_readonly_f41_token',
-              expiresAt: new Date(now + 120_000).toISOString(),
+              tokenType: 'installation',
+              issuedAtMs: now - 1_000,
+              expiresAtMs: now + 120_000,
               permissions: { contents: 'read', pull_requests: 'read', checks: 'read' },
               installationId: INSTALL_ID,
-              repository: REPO,
+              repositories: [REPO],
               repositoryId: REPO_ID,
             },
           }),
@@ -693,6 +695,354 @@ test('F4.1 distinct HTTP/error mapping for broker unavailable (503), device revo
       enrollmentGeneration: 1,
     });
     assert.equal(directRev.revoked, false);
+  } finally {
+    await daemon?.stop().catch(() => {});
+    await new Promise((r) => mockBroker.close(r));
+    await mkdir(dir, { recursive: true }).catch(() => {});
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('F4.2-03: HttpTrustedBrokerClient rejects all 22+ broker-signed malformed/mis-scoped device status, token status, token mint, and ledger responses fail-closed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bke-f42-signed-matrix-'));
+  await chmod(dir, 0o700);
+  const devKey = genP256();
+  const brokerExecKey = genEd25519();
+
+  let statusMutator = (base) => base;
+  let tokenStatusMutator = (base) => base;
+  let tokenResponseOverride = null;
+  let ledgerResponseOverride = null;
+
+  const mockBroker = createServer((req, res) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => {
+      const body = chunks.length > 0 ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : {};
+      const now = Date.now();
+      const urlPath = (req.url ?? '/').split('?')[0];
+
+      if (urlPath === '/v1/enrollment/status') {
+        const basePayload = {
+          version: 1,
+          broker_issuer: ISSUER,
+          worker_id: WORKER,
+          device_id: DEVICE_ID,
+          installation_id: INSTALL_ID,
+          repository: REPO,
+          enrollment_generation: 1,
+          actual_enrollment_generation: 1,
+          status: 'ACTIVE',
+          revoked: false,
+          code: null,
+          nonce: body.nonce,
+          issued_at: new Date(now - 1_000).toISOString(),
+          expires_at: new Date(now + 30_000).toISOString(),
+        };
+        const payload = statusMutator(basePayload, now);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            signed_status: signEd25519Payload(
+              'BKE_DEVICE_STATUS_V1\n',
+              payload,
+              brokerExecKey.privatePem,
+              'broker-exec-k1',
+            ),
+          }),
+        );
+        return;
+      }
+
+      if (urlPath === '/v1/broker/token-status') {
+        const tokenSha = createHash('sha256').update(String(body.token ?? ''), 'utf8').digest('hex');
+        const basePayload = {
+          version: 1,
+          broker_issuer: ISSUER,
+          token_sha256: tokenSha,
+          status: 'ACTIVE',
+          revoked: false,
+          nonce: body.nonce,
+          issued_at: new Date(now - 1_000).toISOString(),
+          expires_at: new Date(now + 30_000).toISOString(),
+        };
+        const payload = tokenStatusMutator(basePayload, now);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            signed_status: signEd25519Payload(
+              'BKE_TOKEN_STATUS_V1\n',
+              payload,
+              brokerExecKey.privatePem,
+              'broker-exec-k1',
+            ),
+          }),
+        );
+        return;
+      }
+
+      if (urlPath === '/v1/broker/tokens') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(tokenResponseOverride ?? { ok: true, token: null }));
+        return;
+      }
+
+      if (urlPath === '/v1/broker/ledger-ops') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(ledgerResponseOverride ?? { ok: true, status: 'COMMITTED', sha: 'b'.repeat(40) }));
+        return;
+      }
+
+      res.writeHead(404);
+      res.end();
+    });
+  });
+
+  await new Promise((r) => mockBroker.listen(0, '127.0.0.1', r));
+  const brokerUrl = `http://127.0.0.1:${mockBroker.address().port}`;
+  const { credsPath, policyPath } = await writeFixtureFiles(dir, { devKey, brokerExecKey, brokerUrl });
+
+  let daemon = null;
+  try {
+    const bundle = await createDesktopControllerRuntimeDependencies(
+      {
+        repository: REPO,
+        prNumber: PR_NUM,
+        workerId: WORKER,
+        pinnedApp: { id: 9001, slug: 'bke-dispatcher-app' },
+        executionId: 'exec-f42-matrix',
+        targetId: 'target-f42-01',
+        profileId: 'profile-f42-01',
+        targetTabId: 7,
+        journalPath: join(dir, 'journal.json'),
+        ipcSocketPath: join(dir, 'bridge.sock'),
+        policyPath,
+        listenHost: '127.0.0.1',
+        listenPort: 0,
+        humanLiveSendAuthorized: false,
+        liveProofs: { githubCasOwnerCertified: true, nativePairingOwnerCertified: true, realBrowserOwnerAccepted: false },
+        executionEnvelopeEnabled: true,
+        asymmetricV2Enabled: true,
+        mediatedCasEnabled: true,
+      },
+      {
+        BKE_REMOTE_BROKER_ENABLED: 'true',
+        BKE_BROKER_BASE_URL: brokerUrl,
+        BKE_DEVICE_CREDENTIALS_PATH: credsPath,
+      },
+    );
+    const client = bundle.brokerClient;
+    assert.ok(client instanceof HttpTrustedBrokerClient);
+
+    const checkReq = {
+      workerId: WORKER,
+      deviceId: DEVICE_ID,
+      installationId: INSTALL_ID,
+      repository: REPO,
+      enrollmentGeneration: 1,
+    };
+
+    // Baseline valid signed ACTIVE succeeds
+    assert.deepEqual(await client.checkDeviceRevocation(checkReq), { status: 'ACTIVE', revoked: false });
+
+    // Full 24-case legitimately Ed25519-signed negative device-status matrix
+    const deviceSignedCases = [
+      ['01_omit_repository', (p) => { const c = { ...p }; delete c.repository; return c; }],
+      ['02_null_repository', (p) => ({ ...p, repository: null })],
+      ['03_non_string_repository', (p) => ({ ...p, repository: 12345 })],
+      ['04_wrong_repository', (p) => ({ ...p, repository: 'other/repo' })],
+      ['05_omit_worker_id', (p) => { const c = { ...p }; delete c.worker_id; return c; }],
+      ['06_wrong_worker_id', (p) => ({ ...p, worker_id: 'worker-other' })],
+      ['07_omit_device_id', (p) => { const c = { ...p }; delete c.device_id; return c; }],
+      ['08_wrong_device_id', (p) => ({ ...p, device_id: 'desktop-other-99' })],
+      ['09_omit_installation_id', (p) => { const c = { ...p }; delete c.installation_id; return c; }],
+      ['10_wrong_installation_id', (p) => ({ ...p, installation_id: '111111111' })],
+      ['11_omit_enrollment_generation', (p) => { const c = { ...p }; delete c.enrollment_generation; return c; }],
+      ['12_wrong_enrollment_generation', (p) => ({ ...p, enrollment_generation: 2 })],
+      ['13_omit_actual_enrollment_generation', (p) => { const c = { ...p }; delete c.actual_enrollment_generation; return c; }],
+      ['14_wrong_actual_enrollment_generation', (p) => ({ ...p, actual_enrollment_generation: 2 })],
+      ['15_status_unknown', (p) => ({ ...p, status: 'UNKNOWN', revoked: false })],
+      ['16_contradictory_active_revoked_true', (p) => ({ ...p, status: 'ACTIVE', revoked: true })],
+      ['17_contradictory_revoked_false', (p) => ({ ...p, status: 'REVOKED', revoked: false })],
+      ['18_omit_revoked', (p) => { const c = { ...p }; delete c.revoked; return c; }],
+      ['19_wrong_nonce', (p) => ({ ...p, nonce: 'wrong-signed-nonce-12345' })],
+      ['20_expired', (p, now) => ({ ...p, issued_at: new Date(now - 60_000).toISOString(), expires_at: new Date(now - 1_000).toISOString() })],
+      ['21_future_issued_at', (p, now) => ({ ...p, issued_at: new Date(now + 20_000).toISOString(), expires_at: new Date(now + 50_000).toISOString() })],
+      ['22_wrong_broker_issuer', (p) => ({ ...p, broker_issuer: 'https://evil.broker.local' })],
+      ['23_extra_unexpected_field', (p) => ({ ...p, extra_field: 'tampered' })],
+      ['24_non_null_code_on_active', (p) => ({ ...p, code: 'SPOOFED_CODE' })],
+    ];
+
+    for (const [name, mut] of deviceSignedCases) {
+      statusMutator = mut;
+      const res = await client.checkDeviceRevocation(checkReq);
+      assert.equal(res.status, 'UNKNOWN', `${name}: must return status=UNKNOWN`);
+      assert.equal(res.revoked, true, `${name}: must fail closed revoked=true`);
+      assert.equal(res.code, 'EXEC_REQ_REVOCATION_UNAVAILABLE', `${name}: expected unavailability code`);
+    }
+
+    // Signed REVOKED response with legitimate signature must still map cleanly to REVOKED
+    statusMutator = (p) => ({ ...p, status: 'REVOKED', revoked: true, code: 'EXEC_REQ_DEVICE_REVOKED' });
+    const revSigned = await client.checkDeviceRevocation(checkReq);
+    assert.deepEqual(revSigned, { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_DEVICE_REVOKED' });
+
+    // Signed token-status negative matrix
+    assert.equal((await client.checkTokenStatus('ghs_valid_tok_123')).status, 'ACTIVE');
+    const tokenSignedCases = [
+      ['tok_status_unknown', (p) => ({ ...p, status: 'UNKNOWN', revoked: false })],
+      ['tok_contradictory_active_revoked', (p) => ({ ...p, status: 'ACTIVE', revoked: true })],
+      ['tok_contradictory_revoked_false', (p) => ({ ...p, status: 'REVOKED', revoked: false })],
+      ['tok_omit_revoked', (p) => { const c = { ...p }; delete c.revoked; return c; }],
+      ['tok_wrong_sha', (p) => ({ ...p, token_sha256: '0'.repeat(64) })],
+      ['tok_wrong_nonce', (p) => ({ ...p, nonce: 'wrong-tok-nonce-12345' })],
+      ['tok_expired', (p, now) => ({ ...p, issued_at: new Date(now - 60_000).toISOString(), expires_at: new Date(now - 1_000).toISOString() })],
+      ['tok_future_issued', (p, now) => ({ ...p, issued_at: new Date(now + 20_000).toISOString(), expires_at: new Date(now + 50_000).toISOString() })],
+      ['tok_wrong_issuer', (p) => ({ ...p, broker_issuer: 'https://evil.broker.local' })],
+      ['tok_extra_field', (p) => ({ ...p, extra_claim: 'tamper' })],
+    ];
+    for (const [name, mut] of tokenSignedCases) {
+      tokenStatusMutator = mut;
+      const tRes = await client.checkTokenStatus('ghs_valid_tok_123');
+      assert.equal(tRes.status, 'UNKNOWN', `${name}: token status must fail closed UNKNOWN`);
+      await assert.rejects(() => client.isRevoked('ghs_valid_tok_123'), /TOKEN_REVOCATION_UNAVAILABLE/);
+    }
+
+    // issueToken strict scope + response validation
+    const ac = new AbortController();
+    await assert.rejects(
+      () =>
+        client.issueToken({
+          repository: 'other/repo',
+          repositoryId: REPO_ID,
+          installationId: INSTALL_ID,
+          workerId: WORKER,
+          requestedPermissions: { contents: 'read' },
+          reason: 'TEST',
+          signal: ac.signal,
+        }),
+      /TOKEN_REPOSITORY_SCOPE_MISMATCH/,
+    );
+    await assert.rejects(
+      () =>
+        client.issueToken({
+          repository: REPO,
+          repositoryId: REPO_ID,
+          installationId: INSTALL_ID,
+          workerId: WORKER,
+          requestedPermissions: { contents: 'write' },
+          reason: 'TEST',
+          signal: ac.signal,
+        }),
+      /TOKEN_DESKTOP_WRITE_TOKEN_FORBIDDEN/,
+    );
+    tokenResponseOverride = {
+      ok: true,
+      token: {
+        token: 'ghs_wrong_repo_tok',
+        tokenType: 'installation',
+        installationId: INSTALL_ID,
+        repositoryId: REPO_ID,
+        repositories: ['evil/other-repo'],
+        permissions: { contents: 'read' },
+        issuedAtMs: Date.now(),
+        expiresAtMs: Date.now() + 60_000,
+      },
+    };
+    await assert.rejects(
+      () =>
+        client.issueToken({
+          repository: REPO,
+          repositoryId: REPO_ID,
+          installationId: INSTALL_ID,
+          workerId: WORKER,
+          requestedPermissions: { contents: 'read' },
+          reason: 'TEST',
+          signal: ac.signal,
+        }),
+      /TOKEN_REPOSITORY_SCOPE_MISMATCH/,
+    );
+
+    // executeLedgerOp strict scope & sha validation
+    const crossRepoOp = await client.executeLedgerOp({
+      operation: 'COMMIT_PRE_SEND_FENCE',
+      repository: 'other/repo',
+      repositoryId: REPO_ID,
+      installationId: INSTALL_ID,
+      workerId: WORKER,
+      prNumber: PR_NUM,
+      headSha: 'a'.repeat(40),
+      attemptId: 'att-cross',
+      refName: `refs/bke/fences/${PR_NUM}/att-cross`,
+      commitMessage: 'fence',
+      treeSha: 'e'.repeat(40),
+    });
+    assert.equal(crossRepoOp.ok, false);
+    assert.equal(crossRepoOp.code, 'BROKER_DEVICE_SCOPE_MISMATCH');
+
+    ledgerResponseOverride = { ok: true, status: 'COMMITTED', sha: null };
+    const badShaOp = await client.executeLedgerOp({
+      operation: 'COMMIT_PRE_SEND_FENCE',
+      repository: REPO,
+      repositoryId: REPO_ID,
+      installationId: INSTALL_ID,
+      workerId: WORKER,
+      prNumber: PR_NUM,
+      headSha: 'a'.repeat(40),
+      attemptId: 'att-bad-sha',
+      refName: `refs/bke/fences/${PR_NUM}/att-bad-sha`,
+      commitMessage: 'fence',
+      treeSha: 'e'.repeat(40),
+    });
+    assert.equal(badShaOp.ok, false);
+    assert.equal(badShaOp.status, 'UNCERTAIN');
+    assert.equal(badShaOp.code, 'BROKER_LEDGER_RESPONSE_INVALID');
+
+    // Integrated DesktopControllerDaemon check: validly signed ACTIVE status omitting repository -> 503 before dispatch
+    statusMutator = (p) => {
+      const c = { ...p };
+      delete c.repository;
+      return c;
+    };
+    daemon = new DesktopControllerDaemon(bundle.config, bundle.deps);
+    const started = await daemon.start({ listen: true });
+    const signedReq = signEnvelopeV2(
+      {
+        protocol_version: EXECUTION_REQUEST_PROTOCOL_VERSION_V2,
+        authorized_capability: AUTHORIZED_CAPABILITY_V2,
+        broker_issuer: ISSUER,
+        audience: AUDIENCE,
+        device_id: DEVICE_ID,
+        enrollment_generation: 1,
+        delivery_id: 'del-f42-omit-repo',
+        repository_owner: 'jan2xo',
+        repository_name: 'bke-worker',
+        repository_id: REPO_ID,
+        installation_identity: INSTALL_ID,
+        pr_number: PR_NUM,
+        head_sha: 'a'.repeat(40),
+        worker_id: WORKER,
+        attempt_id: 'att-f42-omit-repo',
+        action: 'DISPATCH_FIRST_MESSAGE',
+        issued_at: new Date(Date.now() - 1_000).toISOString(),
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      },
+      brokerExecKey.privatePem,
+      'broker-exec-k1',
+    );
+    const execRes = await fetch(`http://127.0.0.1:${started.port}/execution-requests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signedReq),
+    });
+    assert.equal(execRes.status, 503);
+    const execBody = await execRes.json();
+    assert.equal(execBody.code, 'EXEC_REQ_REVOCATION_UNAVAILABLE');
+    assert.equal(execBody.submitInvocations, 0);
+    assert.equal(execBody.journalPhase, 'IDLE');
+    assert.ok(!JSON.stringify(execBody).includes('PRIVATE KEY'));
+    assert.ok(!JSON.stringify(execBody).includes('ghs_'));
   } finally {
     await daemon?.stop().catch(() => {});
     await new Promise((r) => mockBroker.close(r));

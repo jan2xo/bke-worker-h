@@ -692,6 +692,12 @@ export class ExecutionRequestVerifier {
       if (!rev || typeof rev !== 'object') {
         return { ok: false, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
       }
+      if (isV2 && rev.status !== 'ACTIVE') {
+        if (rev.status === 'REVOKED') {
+          return { ok: false, code: rev.code || 'EXEC_REQ_DEVICE_REVOKED' };
+        }
+        return { ok: false, code: rev.code || 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+      }
       if (rev.status !== undefined) {
         if (rev.status === 'REVOKED') {
           return { ok: false, code: rev.code || 'EXEC_REQ_DEVICE_REVOKED' };

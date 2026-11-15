@@ -1,12 +1,12 @@
 # Canonical Promotion Plan (`jan2xo/bke-worker-h` -> `jan2xo/bke-worker`)
 
-This document reconciles the completed **F1 + F2 + F3 + F4** BKE Desktop Worker implementation in `jan2xo/bke-worker-h` against the canonical governance gates enforced by `jan2xo/bke-worker/.github/workflows/pr-guard.yml` (Issue `#149`).
+This document reconciles the completed **F1 + F2 + F3 + F4 + F4.1 + F4.2** BKE Desktop Worker implementation in `jan2xo/bke-worker-h` against the canonical governance gates enforced by `jan2xo/bke-worker/.github/workflows/pr-guard.yml` (Issue `#149`).
 
 > **Governance Reminder:** Do **NOT** open, merge, or reuse any oversized omnibus PR against `jan2xo/bke-worker` during sandbox engineering. Each canonical promotion PR requires an open `bke:mvp`-labeled GitHub issue referenced via `MVP-Task: #<issue>` in the PR body.
 
 ---
 
-## 1. Exact `pr-guard.yml` Rules Reconciled Against Measured F1–F4 Source
+## 1. Exact `pr-guard.yml` Rules Reconciled Against Measured F1–F4.2 Source
 
 Inspecting canonical `bke-worker/.github/workflows/pr-guard.yml` (lines 250–376) establishes five hard gates:
 
@@ -17,11 +17,11 @@ Inspecting canonical `bke-worker/.github/workflows/pr-guard.yml` (lines 250–37
    - `pr-guard.yml:348-356` blocks any change touching:
      `cloudflare-relay/`, `android-gecko/`, `src/`, **`deploy/`**, `BKE.Worker.sln`, `Directory.Build.props`
      unless the linked `MVP-Task: #<issue>` body/title literally contains the matching path prefix.
-   - `cloudflare-relay/`, `android-gecko/`, `src/`, `BKE.Worker.sln`, and `Directory.Build.props` remain **100% untouched** across F1–F4.
-   - Only `deploy/desktop-controller.env.example` (70 lines, including F3/F4 default-OFF V2/broker/mediated-CAS fields) and `deploy/owner-native-policy.template.json` (13 lines) touch `deploy/`, so that specific PR's `#<issue>` must explicitly name `deploy/`.
+   - `cloudflare-relay/`, `android-gecko/`, `src/`, `BKE.Worker.sln`, and `Directory.Build.props` remain **100% untouched** across F1–F4.2.
+   - Only `deploy/desktop-controller.env.example` (71 lines, including F3/F4/F4.1 default-OFF V2/broker/mediated-CAS fields) and `deploy/owner-native-policy.template.json` (13 lines) touch `deploy/`, so that specific PR's `#<issue>` must explicitly name `deploy/`.
 3. **CI / Workflow Protection Rule:**
    - Any file under `.github/` requires owner label `bke:gate-change` (`pr-guard.yml:360-362`).
-   - `.github/workflows/hydrogen-sandbox-ci.yml` (85 lines) lives at the sandbox root (`jan2xo/bke-worker-h`) and is **excluded** from canonical `jan2xo/bke-worker` promotion; `bke-worker/.github/workflows/pr-guard.yml` itself is untouched.
+   - `.github/workflows/hydrogen-sandbox-ci.yml` (86 lines) lives at the sandbox root (`jan2xo/bke-worker-h`) and is **excluded** from canonical `jan2xo/bke-worker` promotion; `bke-worker/.github/workflows/pr-guard.yml` itself is untouched.
 4. **Added Markdown Filename Rule:**
    - Every newly added `.md` file causes `mvp-scope-gate` failure unless its **exact repo-relative filename** appears in the linked `#<issue>` body/title (`pr-guard.yml:365-369`).
    - Any canonical PR adding F2/F3/F4 markdown docs MUST list each exact filename in its issue:
@@ -34,38 +34,39 @@ Inspecting canonical `bke-worker/.github/workflows/pr-guard.yml` (lines 250–37
 
 ## 2. Measured File Sizes & Required Splitting Before Sub-500-Line PR Submission
 
-Measured via `wc -l` on current verified F1+F2+F3+F4 source:
+Measured via `wc -l` on current verified F1+F2+F3+F4+F4.1+F4.2 source:
 
 ### 2.1 Oversized Modules (`> 500` lines each in `jan2xo/bke-worker-h`)
 The following modules currently exceed 500 lines individually and therefore **either require file-splitting into `<= 450`-line modules before opening canonical PRs OR owner label `bke:oversize-ok`**:
 
-| File (`bke-worker/...`) | Measured Lines | F4 Change Scope | Recommended Sub-500-Line Split (or `bke:oversize-ok`) |
+| File (`bke-worker/...`) | Measured Lines | F4/F4.1/F4.2 Change Scope | Recommended Sub-500-Line Split (or `bke:oversize-ok`) |
 |---|---:|---|---|
 | `browser-extension/src/service-worker.ts` | 530 | Baseline F1 delta (+187) | Fits PR diff budget (`<= 187` added lines on existing baseline file). |
 | `browser-extension/src/controller-transport.ts` | 860 | F1/F2 | Split P-256 handshake (`controller-handshake.ts`, ~350) + router (`controller-transport.ts`, ~450). |
 | `browser-extension/native-host/claim/github-f1-ledger.ts` | 1,299 | F4 added `mediatedLedgerClient` across all 4 CAS ops & `forbidDesktopWriteToken` (+187) | Split mediated/REST CAS helpers (`github-ledger-cas.ts`, ~430), authority (~430), receipt builders (~430). |
 | `browser-extension/native-host/claim/desktop-controller.ts` | 975 | F1/F2 | Split `FileExecutionJournal` + POSIX lock (`file-execution-journal.ts`, ~390) from `DesktopController` (~480). |
 | `browser-extension/native-host/claim/controller-daemon.ts` | 1,459 | F4/F4.1 added strict V2 isolation, `503`/`403`/`401` error mapping, `mediatedCasEnabled`, and `runCli('start')` runtime wiring (+215) | Split HTTP route handler (`daemon-http-routes.ts`, ~440), CLI/doctor (`daemon-cli.ts`, ~480), core daemon (~480). |
-| `browser-extension/native-host/claim/runtime-broker-factory.ts` | 902 | New in F4.1 (owner `0o600` credentials loader, `HttpTrustedBrokerClient`, `createDesktopControllerRuntimeDependencies`) | Split credentials loader (`device-credentials-loader.ts`, ~325), HTTP client (`http-trusted-broker-client.ts`, ~320), factory (~260). |
-| `browser-extension/native-host/claim/github-app-harness.ts` | 815 | F4 added V2 strict config guards, mandatory tri-state `deviceRevocationChecker`, exact `expectedEnrollmentGeneration` (+71) | Split V1/V2 cryptographic verifiers (`envelope-crypto.ts`, ~360) + `ExecutionRequestVerifier` (~450). |
+| `browser-extension/native-host/claim/runtime-broker-factory.ts` | 1,165 | F4.1 + F4.2 signed authority/schema/replay/ledger/token validation hardening | Split credentials loader (`device-credentials-loader.ts`, ~325), payload validators (`broker-status-validators.ts`, ~400), HTTP client + factory (~440). |
+| `browser-extension/native-host/claim/github-app-harness.ts` | 821 | F4 + F4.2 strict `ACTIVE` requirement, V2 strict config guards, mandatory tri-state `deviceRevocationChecker`, exact `expectedEnrollmentGeneration` | Split V1/V2 cryptographic verifiers (`envelope-crypto.ts`, ~360) + `ExecutionRequestVerifier` (~460). |
 | `browser-extension/native-host/claim/github-authority-provider.ts` | 545 | F3 | Extract pagination + permission validators (`github-authority-validators.ts`, ~180) -> core ~365 lines. |
-| `browser-extension/native-host/claim/token-lifecycle.ts` | 550 | F4/F4.1 removed fail-open `.catch(() => false)`, mandatory revocation authority, `REMOTE_OWNER_CERTIFIED_BROKER` (+39) | Split broker transport stubs/clampers (`token-broker-transport.ts`, ~165) -> provider ~385 lines. |
+| `browser-extension/native-host/claim/token-lifecycle.ts` | 550 | F4/F4.1/F4.2 fail-closed revocation, `REMOTE_OWNER_CERTIFIED_BROKER`, required `repositoryId`, `+5s` skew | Split broker transport stubs/clampers (`token-broker-transport.ts`, ~165) -> provider ~385 lines. |
 | `browser-extension/native-host/claim/tests/controller-daemon.test.mjs` | 594 | F2 | Split HTTP tests (~300) and CLI/HALT tests (~295). |
 | `browser-extension/native-host/claim/tests/f4-security-remediation.test.mjs` | 692 | New in F4 (P0-01/P0-02/P0-03 claim tests) | Split P0-01/P0-02 tests (~360) and P0-03/daemon tests (~335). |
-| `browser-extension/native-host/claim/tests/runtime-wiring.test.mjs` | 702 | New in F4.1 (factory, owner `0o600` credentials, `controller:cli start` fail-closed & error distinction tests) | Split fail-closed CLI startup (~350) and HTTP error mapping tests (~355). |
+| `browser-extension/native-host/claim/tests/runtime-wiring.test.mjs` | 1,052 | F4.1 + F4.2 24-case signed device status + 10-case token status + daemon `503` test | Split fail-closed CLI startup (~350), error mapping (~350), and F4.2 signed-matrix tests (~355). |
 | `browser-extension/native-host/claim/tests/reliability-adversarial.test.mjs` | 986 | F1/F2 | Split Groups 1–3 (~440), Groups 4–5 (~300), Groups 6–7 (~320). |
 | `browser-extension/native-host/claim/tests/e2e-two-turn-acceptance.test.mjs` | 1,111 | F1/F2 | Keep webhook 2-turn (~480), crash/drift (~180), signed V1 E2E (~450) in separate files. |
-| `integrations/desktop-broker/src/device-enrollment.ts` | 712 | F4 exact generation inspection (+21) | Extract `signAdminApproval`/`verifyAdminApproval` (`admin-approval.ts`, ~260) -> registry ~450 lines. |
+| `integrations/desktop-broker/src/broker-client.ts` | 742 | F4 + F4.2 signed status/token/mint/ledger identity & schema hardening | Extract signed-status schema validators (`broker-status-validators.ts`, ~350) -> client ~395 lines. |
+| `integrations/desktop-broker/src/device-enrollment.ts` | 748 | F4 + F4.2 strict 9-key assertion & `inspectDeviceStatus` param checks | Extract `signAdminApproval`/`verifyAdminApproval` (`admin-approval.ts`, ~260) -> registry ~485 lines. |
 | `integrations/desktop-broker/src/github-app-adapter.ts` | 939 | F4 completed 4-op server CAS & ref preconditions (+369) | Extract server CAS helper (`server-ledger-ops.ts`, ~450) -> adapter ~480 lines. |
-| `integrations/desktop-broker/src/broker-service.ts` | 796 | F4 signed revocation/token status & zero desktop `contents: write` (+113) | Extract key-ring & status signers (`broker-keystore.ts`, ~350) -> service ~445 lines. |
+| `integrations/desktop-broker/src/broker-service.ts` | 861 | F4 + F4.2 `usedStatusNonces` replay persistence & pre-sign payload assertions | Extract key-ring & status signers (`broker-keystore.ts`, ~400) -> service ~460 lines. |
 | `integrations/desktop-broker/tests/broker-service.test.mjs` | 755 | F4 updated for `contents: read` desktop tokens (+31) | Split broker tests (#1–14, ~450) and rotation/CAS/F3-05 tests (#15–17, ~305). |
 | `integrations/desktop-broker/tests/multiprocess-e2e.test.mjs` | 729 | F4 mediated CAS & revocation HTTP assertions (+36) | Move child-process spawner helpers into shared fixture (~250) -> E2E ~480 lines. |
-| `integrations/desktop-broker/tests/cli-operational-e2e.test.mjs` | 691 | New in F4.1 (`controller:cli start` 3-process operational E2E: Turn 1/2, outage, restart, quarantine, revocation) | Split Turn 1/2 + outage (~350) and restart/quarantine/revocation (~345). |
+| `integrations/desktop-broker/tests/cli-operational-e2e.test.mjs` | 1,121 | F4.1 + F4.2 `controller:cli start` 3-process E2E + signed omit-repo `503` -> Turn 1/2 | Split F4.1 Turn 1/2 + outage (~450), quarantine/revocation (~250), and F4.2 omit-repo (~425). |
 | `integrations/desktop-broker/tests/chaos-adversarial.test.mjs` | 775 | F4 mediated CAS + `forbidDesktopWriteToken` updates (+41) | Split scenarios #1–9 (~390) and #10–18 (~385). |
-| `integrations/desktop-broker/tests/mediated-cas.test.mjs` | 689 | New in F4 (P0-02 HTTP fault matrix + P0-03 4-op CAS) | Split signed HTTP revocation matrix (~350) and 4-op CAS tests (~340). |
+| `integrations/desktop-broker/tests/mediated-cas.test.mjs` | 781 | F4 + F4.2 validly re-signed status fault matrix & replay/no-nonce tests | Split signed HTTP revocation matrix (~440) and 4-op CAS tests (~345). |
 | `integrations/desktop-broker/tests/multihost-safety.test.mjs` | 594 | New in F4 (F4-04 multi-host race/rotation/quarantine) | Split race/rotation (~300) and quarantine/Turn2 CAS (~295). |
 
-*(All other F3/F4/F4.1 files—`f3-hardening.test.mjs` [457], `command-center-observer.ts` [408], `broker-client.ts` [480], `broker-server.ts` [348], `types.ts` [239], `mock-github-server.mjs` [309], `helpers/controller-runner.mjs` [113], `device-enrollment.test.mjs` [446], `deploy/desktop-controller.env.example` [71], `scripts/package-desktop-worker.sh` [307], `docs/F4_SECURITY_REVIEW_PACKAGE.md` [<150]—already sit cleanly below 500 lines.)*
+*(All other F3/F4/F4.1/F4.2 files—`f3-hardening.test.mjs` [457], `command-center-observer.ts` [408], `broker-server.ts` [341], `types.ts` [239], `mock-github-server.mjs` [310], `helpers/controller-runner.mjs` [113], `device-enrollment.test.mjs` [446], `deploy/desktop-controller.env.example` [71], `scripts/package-desktop-worker.sh` [307], `docs/F4_SECURITY_REVIEW_PACKAGE.md` [116]—already sit cleanly below 500 lines.)*
 
 ---
 

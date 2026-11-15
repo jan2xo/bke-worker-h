@@ -369,8 +369,8 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
     }
     if (
       this.config.repositoryId !== undefined &&
-      issued.repositoryId !== undefined &&
-      issued.repositoryId !== this.config.repositoryId
+      ((this.broker.kind === 'REMOTE_OWNER_CERTIFIED_BROKER' && issued.repositoryId === undefined) ||
+        (issued.repositoryId !== undefined && issued.repositoryId !== this.config.repositoryId))
     ) {
       throw Error('TOKEN_REPOSITORY_ID_MISMATCH');
     }
@@ -379,7 +379,7 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
     if (!Number.isFinite(issued.issuedAtMs) || !Number.isFinite(issued.expiresAtMs)) {
       throw Error('TOKEN_TIMESTAMPS_INVALID');
     }
-    if (issued.issuedAtMs > now + 10_000) {
+    if (issued.issuedAtMs > now + 5_000) {
       throw Error('TOKEN_ISSUED_IN_FUTURE');
     }
     if (issued.expiresAtMs <= now + this.minValidRemainingMs) {

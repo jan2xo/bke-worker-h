@@ -183,52 +183,43 @@ export class SandboxBrokerHttpServer {
         return;
       }
       if (path === '/v1/enrollment/status') {
-        const workerId = String(body.workerId ?? body.worker_id ?? '');
-        const deviceId =
-          typeof (body.deviceId ?? body.device_id) === 'string'
-            ? String(body.deviceId ?? body.device_id)
-            : undefined;
-        const installationId =
-          typeof (body.installationId ?? body.installation_id) === 'string'
-            ? String(body.installationId ?? body.installation_id)
-            : undefined;
-        const repository =
-          typeof body.repository === 'string' ? body.repository : undefined;
-        const rawGen = body.enrollmentGeneration ?? body.min_generation ?? body.enrollment_generation;
-        const enrollmentGeneration = typeof rawGen === 'number' ? rawGen : undefined;
-        const nonce = typeof body.nonce === 'string' ? body.nonce : '';
-        if (nonce) {
-          const signedStatus = await this.broker.getSignedDeviceStatus({
-            workerId,
-            deviceId,
-            installationId,
-            repository,
-            enrollmentGeneration,
-            nonce,
-          });
-          sendJson(res, 200, {
-            ok: true,
-            status: signedStatus.payload.status,
-            revoked: signedStatus.payload.revoked,
-            code: signedStatus.payload.code,
-            enrollment_generation: signedStatus.payload.actual_enrollment_generation,
-            signed_status: signedStatus,
-          });
-          return;
+        const rawWorker = body.workerId ?? body.worker_id;
+        if (typeof rawWorker !== 'string' || !rawWorker) {
+          throw Error('BROKER_STATUS_PARAMS_INVALID');
         }
-        const status = await this.enrollment.inspectDeviceStatus({
-          workerId,
-          deviceId,
-          installationId,
-          repository,
-          enrollmentGeneration,
+        const rawDevice = body.deviceId ?? body.device_id;
+        if (rawDevice !== undefined && typeof rawDevice !== 'string') {
+          throw Error('BROKER_STATUS_PARAMS_INVALID');
+        }
+        const rawInstall = body.installationId ?? body.installation_id;
+        if (rawInstall !== undefined && typeof rawInstall !== 'string') {
+          throw Error('BROKER_STATUS_PARAMS_INVALID');
+        }
+        if (body.repository !== undefined && typeof body.repository !== 'string') {
+          throw Error('BROKER_STATUS_PARAMS_INVALID');
+        }
+        const rawGen = body.enrollmentGeneration ?? body.min_generation ?? body.enrollment_generation;
+        if (rawGen !== undefined && (typeof rawGen !== 'number' || !Number.isSafeInteger(rawGen))) {
+          throw Error('BROKER_STATUS_PARAMS_INVALID');
+        }
+        if (typeof body.nonce !== 'string' || !body.nonce) {
+          throw Error('BROKER_STATUS_NONCE_INVALID');
+        }
+        const signedStatus = await this.broker.getSignedDeviceStatus({
+          workerId: rawWorker,
+          deviceId: rawDevice,
+          installationId: rawInstall,
+          repository: body.repository,
+          enrollmentGeneration: rawGen,
+          nonce: body.nonce,
         });
         sendJson(res, 200, {
           ok: true,
-          status: status.status,
-          revoked: status.revoked,
-          code: status.code ?? null,
-          enrollment_generation: status.device?.enrollment_generation ?? null,
+          status: signedStatus.payload.status,
+          revoked: signedStatus.payload.revoked,
+          code: signedStatus.payload.code,
+          enrollment_generation: signedStatus.payload.actual_enrollment_generation,
+          signed_status: signedStatus,
         });
         return;
       }
@@ -243,20 +234,22 @@ export class SandboxBrokerHttpServer {
         return;
       }
       if (path === '/v1/broker/token-status') {
-        const token = String(body.token ?? '');
-        const nonce = typeof body.nonce === 'string' ? body.nonce : '';
-        if (nonce) {
-          const signedTokenStatus = await this.broker.getSignedTokenStatus({ token, nonce });
-          sendJson(res, 200, {
-            ok: true,
-            status: signedTokenStatus.payload.status,
-            revoked: signedTokenStatus.payload.revoked,
-            signed_status: signedTokenStatus,
-          });
-          return;
+        if (typeof body.token !== 'string' || !body.token.trim()) {
+          throw Error('BROKER_TOKEN_INVALID');
         }
-        const revoked = await this.broker.isTokenRevoked(token);
-        sendJson(res, 200, { ok: true, status: revoked ? 'REVOKED' : 'ACTIVE', revoked });
+        if (typeof body.nonce !== 'string' || !body.nonce) {
+          throw Error('BROKER_STATUS_NONCE_INVALID');
+        }
+        const signedTokenStatus = await this.broker.getSignedTokenStatus({
+          token: body.token,
+          nonce: body.nonce,
+        });
+        sendJson(res, 200, {
+          ok: true,
+          status: signedTokenStatus.payload.status,
+          revoked: signedTokenStatus.payload.revoked,
+          signed_status: signedTokenStatus,
+        });
         return;
       }
       if (path === '/v1/broker/revoke-token') {

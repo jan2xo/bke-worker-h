@@ -130,8 +130,65 @@ export class DeviceKeyPairSigner {
   }
 }
 
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const WORKER_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const INSTALL_RE = /^[0-9]{1,20}$/;
+const DEVICE_ID_RE = /^[A-Za-z0-9._:-]{4,128}$/;
+const SHA256_HEX_RE = /^[a-f0-9]{64}$/;
+const SHA40_RE = /^[a-f0-9]{40}$/;
+const STATUS_NONCE_RE = /^[A-Za-z0-9._:-]{8,128}$/;
+const ED25519_SIG_B64URL_RE = /^[A-Za-z0-9_-]{86}$/;
+const ISO8601_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const MAX_SEEN_STATUS_NONCES = 4_096;
+
+const DEVICE_STATUS_REQUIRED_KEYS = [
+  'actual_enrollment_generation',
+  'broker_issuer',
+  'device_id',
+  'enrollment_generation',
+  'expires_at',
+  'installation_id',
+  'issued_at',
+  'nonce',
+  'repository',
+  'revoked',
+  'status',
+  'version',
+  'worker_id',
+] as const;
+
+const TOKEN_STATUS_REQUIRED_KEYS = [
+  'broker_issuer',
+  'expires_at',
+  'issued_at',
+  'nonce',
+  'revoked',
+  'status',
+  'token_sha256',
+  'version',
+] as const;
+
+const ALLOWED_TOKEN_PERM_SCOPES = new Set(['contents', 'pull_requests', 'checks']);
+const ALLOWED_MEDIATED_OPS = new Set([
+  'COMMIT_PRE_SEND_FENCE',
+  'CONSUME_SEND_CLAIM',
+  'RECONCILE_CONVERSATION',
+  'MARK_DELIVERY_UNCERTAIN',
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isValidRepoName(value: unknown): value is string {
+  if (typeof value !== 'string' || !REPO_RE.test(value)) return false;
+  const parts = value.split('/');
+  return parts.length === 2 && parts[0] !== '.' && parts[0] !== '..' && parts[1] !== '.' && parts[1] !== '..';
+}
+
 export class SandboxHttpTokenBrokerClient {
   readonly kind = 'REMOTE_OWNER_CERTIFIED_BROKER' as const;
+  private readonly seenStatusNonces = new Set<string>();
 
   constructor(
     private readonly config: {
@@ -143,11 +200,20 @@ export class SandboxHttpTokenBrokerClient {
       expectedBrokerIssuer?: string;
       timeoutMs?: number;
       repository?: string;
+      repositoryId?: number;
       installationId?: string;
       workerId?: string;
       nowMs?: () => number;
     },
   ) {}
+
+  private recordStatusNonce(nonce: string): void {
+    this.seenStatusNonces.add(nonce);
+    if (this.seenStatusNonces.size > MAX_SEEN_STATUS_NONCES) {
+      const oldest = this.seenStatusNonces.values().next().value;
+      if (oldest !== undefined) this.seenStatusNonces.delete(oldest);
+    }
+  }
 
   private verifyBrokerSignedPayload(
     domainPrefix: string,
@@ -156,18 +222,19 @@ export class SandboxHttpTokenBrokerClient {
     if (!this.config.brokerPublicKeysById || this.config.brokerPublicKeysById.size === 0 || !this.config.expectedBrokerIssuer) {
       return { ok: false };
     }
-    if (!signedWrapper || typeof signedWrapper !== 'object' || Array.isArray(signedWrapper)) {
+    if (!isPlainObject(signedWrapper)) {
       return { ok: false };
     }
-    const wrap = signedWrapper as Record<string, unknown>;
+    const wrap = signedWrapper;
     if (
       Object.keys(wrap).sort().join(',') !== 'key_id,payload,signature_alg,signature_b64url' ||
       wrap.signature_alg !== 'Ed25519' ||
       typeof wrap.key_id !== 'string' ||
+      wrap.key_id.length === 0 ||
+      wrap.key_id.length > 128 ||
       typeof wrap.signature_b64url !== 'string' ||
-      !wrap.payload ||
-      typeof wrap.payload !== 'object' ||
-      Array.isArray(wrap.payload)
+      !ED25519_SIG_B64URL_RE.test(wrap.signature_b64url) ||
+      !isPlainObject(wrap.payload)
     ) {
       return { ok: false };
     }
@@ -176,17 +243,25 @@ export class SandboxHttpTokenBrokerClient {
     try {
       const keyObj = createPublicKey(pubPem);
       if (keyObj.asymmetricKeyType !== 'ed25519') return { ok: false };
-      const payload = wrap.payload as Record<string, unknown>;
+      const payload = wrap.payload;
       const input = Buffer.from(domainPrefix + canonicalJson(payload), 'utf8');
       const sig = Buffer.from(wrap.signature_b64url, 'base64url');
-      if (!cryptoVerify(null, input, keyObj, sig)) return { ok: false };
+      if (sig.length !== 64 || !cryptoVerify(null, input, keyObj, sig)) return { ok: false };
 
       if (payload.version !== 1 || payload.broker_issuer !== this.config.expectedBrokerIssuer) {
         return { ok: false };
       }
+      if (
+        typeof payload.issued_at !== 'string' ||
+        typeof payload.expires_at !== 'string' ||
+        !ISO8601_RE.test(payload.issued_at) ||
+        !ISO8601_RE.test(payload.expires_at)
+      ) {
+        return { ok: false };
+      }
       const now = (this.config.nowMs ?? Date.now)();
-      const issued = typeof payload.issued_at === 'string' ? Date.parse(payload.issued_at) : NaN;
-      const expires = typeof payload.expires_at === 'string' ? Date.parse(payload.expires_at) : NaN;
+      const issued = Date.parse(payload.issued_at);
+      const expires = Date.parse(payload.expires_at);
       if (!Number.isFinite(issued) || !Number.isFinite(expires) || expires <= issued || expires - issued > 120_000) {
         return { ok: false };
       }
@@ -203,7 +278,7 @@ export class SandboxHttpTokenBrokerClient {
     path: string,
     body: unknown,
     externalSignal?: AbortSignal,
-  ): Promise<{ ok: boolean; status: number; data: Record<string, unknown> | null }> {
+  ): Promise<{ ok: boolean; status: number; timedOut: boolean; data: Record<string, unknown> | null }> {
     const controller = new AbortController();
     const timeoutMs = this.config.timeoutMs ?? 4_000;
     let timedOut = false;
@@ -223,15 +298,16 @@ export class SandboxHttpTokenBrokerClient {
         body: JSON.stringify(body),
       });
       if (res.status >= 300 && res.status < 400) {
-        return { ok: false, status: res.status, data: { code: 'BROKER_REDIRECT_BLOCKED' } };
+        return { ok: false, status: res.status, timedOut: false, data: { code: 'BROKER_REDIRECT_BLOCKED' } };
       }
-      const data = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-      return { ok: res.ok, status: res.status, data };
+      const rawData = await res.json().catch(() => null);
+      const data = isPlainObject(rawData) ? rawData : null;
+      return { ok: res.ok, status: res.status, timedOut: false, data };
     } catch {
       if (timedOut) {
-        return { ok: false, status: 504, data: { code: 'BROKER_TIMEOUT' } };
+        return { ok: false, status: 504, timedOut: true, data: { code: 'BROKER_TIMEOUT' } };
       }
-      return { ok: false, status: 503, data: { code: 'BROKER_TRANSPORT_UNAVAILABLE' } };
+      return { ok: false, status: 503, timedOut: false, data: { code: 'BROKER_TRANSPORT_UNAVAILABLE' } };
     } finally {
       clearTimeout(timer);
       externalSignal?.removeEventListener('abort', onExternalAbort);
@@ -245,16 +321,37 @@ export class SandboxHttpTokenBrokerClient {
     repository?: string;
     enrollmentGeneration?: number;
   }): Promise<{ status: DeviceRevocationStatus; revoked: boolean; code?: string }> {
-    const nonce = randomBytes(24).toString('base64url');
     const targetDeviceId = info.deviceId ?? this.config.deviceId;
     const targetInstall = info.installationId ?? this.config.installationId;
     const targetRepo = info.repository ?? this.config.repository;
+    const targetGen = info.enrollmentGeneration ?? this.config.enrollmentGeneration;
+
+    if (
+      typeof info.workerId !== 'string' ||
+      !WORKER_RE.test(info.workerId) ||
+      (this.config.workerId !== undefined && info.workerId !== this.config.workerId) ||
+      typeof targetDeviceId !== 'string' ||
+      !DEVICE_ID_RE.test(targetDeviceId) ||
+      targetDeviceId !== this.config.deviceId ||
+      typeof targetInstall !== 'string' ||
+      !INSTALL_RE.test(targetInstall) ||
+      (this.config.installationId !== undefined && targetInstall !== this.config.installationId) ||
+      !isValidRepoName(targetRepo) ||
+      (this.config.repository !== undefined && targetRepo.toLowerCase() !== this.config.repository.toLowerCase()) ||
+      typeof targetGen !== 'number' ||
+      !Number.isSafeInteger(targetGen) ||
+      targetGen < 1
+    ) {
+      return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+    }
+
+    const nonce = randomBytes(24).toString('base64url');
     const res = await this.postJsonWithTimeout('/v1/enrollment/status', {
       worker_id: info.workerId,
       device_id: targetDeviceId,
       installation_id: targetInstall,
       repository: targetRepo,
-      enrollment_generation: info.enrollmentGeneration,
+      enrollment_generation: targetGen,
       nonce,
     });
     if (!res.ok || !res.data || res.data.ok !== true) {
@@ -265,31 +362,71 @@ export class SandboxHttpTokenBrokerClient {
       return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
     }
     const p = verified.payload;
+
+    const payloadKeysWithoutCode = Object.keys(p)
+      .filter((k) => k !== 'code')
+      .sort()
+      .join(',');
+    if (payloadKeysWithoutCode !== DEVICE_STATUS_REQUIRED_KEYS.join(',')) {
+      return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+    }
+
     if (
+      typeof p.nonce !== 'string' ||
+      !STATUS_NONCE_RE.test(p.nonce) ||
       p.nonce !== nonce ||
+      this.seenStatusNonces.has(p.nonce) ||
+      typeof p.worker_id !== 'string' ||
       p.worker_id !== info.workerId ||
+      (this.config.workerId !== undefined && p.worker_id !== this.config.workerId) ||
+      typeof p.device_id !== 'string' ||
       p.device_id !== targetDeviceId ||
-      (targetInstall && p.installation_id !== targetInstall) ||
-      (targetRepo && typeof p.repository === 'string' && p.repository.toLowerCase() !== targetRepo.toLowerCase()) ||
-      (typeof info.enrollmentGeneration === 'number' && p.enrollment_generation !== info.enrollmentGeneration)
+      p.device_id !== this.config.deviceId ||
+      typeof p.installation_id !== 'string' ||
+      p.installation_id !== targetInstall ||
+      (this.config.installationId !== undefined && p.installation_id !== this.config.installationId) ||
+      !isValidRepoName(p.repository) ||
+      p.repository.toLowerCase() !== targetRepo.toLowerCase() ||
+      (this.config.repository !== undefined && p.repository.toLowerCase() !== this.config.repository.toLowerCase()) ||
+      typeof p.enrollment_generation !== 'number' ||
+      !Number.isSafeInteger(p.enrollment_generation) ||
+      p.enrollment_generation !== targetGen ||
+      typeof p.revoked !== 'boolean'
     ) {
       return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
     }
-    if (p.status === 'REVOKED' || p.revoked === true) {
+    this.recordStatusNonce(p.nonce);
+
+    if (p.status === 'REVOKED' && p.revoked === true) {
+      if (p.code !== undefined && p.code !== null && typeof p.code !== 'string') {
+        return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+      }
+      if (
+        p.actual_enrollment_generation !== null &&
+        (typeof p.actual_enrollment_generation !== 'number' ||
+          !Number.isSafeInteger(p.actual_enrollment_generation) ||
+          p.actual_enrollment_generation < 1)
+      ) {
+        return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
+      }
       return {
         status: 'REVOKED',
         revoked: true,
         code: typeof p.code === 'string' && p.code ? p.code : 'EXEC_REQ_DEVICE_REVOKED',
       };
     }
+
     if (
       p.status === 'ACTIVE' &&
       p.revoked === false &&
-      (typeof info.enrollmentGeneration !== 'number' ||
-        p.actual_enrollment_generation === info.enrollmentGeneration)
+      (p.code === undefined || p.code === null) &&
+      typeof p.actual_enrollment_generation === 'number' &&
+      Number.isSafeInteger(p.actual_enrollment_generation) &&
+      p.actual_enrollment_generation === targetGen
     ) {
       return { status: 'ACTIVE', revoked: false };
     }
+
     return { status: 'UNKNOWN', revoked: true, code: 'EXEC_REQ_REVOCATION_UNAVAILABLE' };
   }
 
@@ -310,6 +447,41 @@ export class SandboxHttpTokenBrokerClient {
     issuedAtMs: number;
     expiresAtMs: number;
   }> {
+    if (this.config.workerId !== undefined && request.workerId !== this.config.workerId) {
+      throw Error('TOKEN_WORKER_MISMATCH');
+    }
+    if (this.config.installationId !== undefined && request.installationId !== this.config.installationId) {
+      throw Error('TOKEN_INSTALLATION_MISMATCH');
+    }
+    if (
+      !isValidRepoName(request.repository) ||
+      (this.config.repository !== undefined && request.repository.toLowerCase() !== this.config.repository.toLowerCase())
+    ) {
+      throw Error('TOKEN_REPOSITORY_SCOPE_MISMATCH');
+    }
+    if (
+      this.config.repositoryId !== undefined &&
+      request.repositoryId !== undefined &&
+      request.repositoryId !== this.config.repositoryId
+    ) {
+      throw Error('TOKEN_REPOSITORY_ID_MISMATCH');
+    }
+    if (!isPlainObject(request.requestedPermissions)) {
+      throw Error('TOKEN_PERMISSION_ELEVATION_FORBIDDEN');
+    }
+    for (const [scope, level] of Object.entries(request.requestedPermissions)) {
+      if (scope === 'contents' && level === 'write') {
+        throw Error('TOKEN_DESKTOP_WRITE_TOKEN_FORBIDDEN');
+      }
+      if (!ALLOWED_TOKEN_PERM_SCOPES.has(scope)) {
+        if (level !== 'none') throw Error('TOKEN_PERMISSION_ELEVATION_FORBIDDEN');
+        continue;
+      }
+      if (level !== 'read' && level !== 'none') {
+        throw Error('TOKEN_PERMISSION_ELEVATION_FORBIDDEN');
+      }
+    }
+
     const assertion = this.config.deviceSigner.signDeviceAssertion({
       worker_id: request.workerId,
       device_id: this.config.deviceId,
@@ -320,47 +492,108 @@ export class SandboxHttpTokenBrokerClient {
       nowMs: (this.config.nowMs ?? Date.now)(),
     });
 
-    const filteredPerms: Record<string, 'read' | 'write'> = {};
+    const filteredPerms: Record<string, 'read'> = {};
     for (const [k, v] of Object.entries(request.requestedPermissions)) {
-      if (v === 'read' || v === 'write') filteredPerms[k] = v;
+      if (v === 'read') filteredPerms[k] = 'read';
     }
 
-    const res = await globalThis.fetch(`${this.config.brokerBaseUrl.replace(/\/+$/, '')}/v1/broker/tokens`, {
-      method: 'POST',
-      redirect: 'manual',
-      signal: request.signal,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    const res = await this.postJsonWithTimeout(
+      '/v1/broker/tokens',
+      {
         repository: request.repository,
-        repository_id: request.repositoryId ?? 0,
+        repository_id: request.repositoryId ?? this.config.repositoryId ?? 0,
         installation_id: request.installationId,
         worker_id: request.workerId,
         requested_permissions: filteredPerms,
         device_assertion: assertion,
-      }),
-    });
+      },
+      request.signal,
+    );
 
-    if (res.status >= 300 && res.status < 400) {
+    if (res.timedOut) {
+      throw Error('TOKEN_BROKER_TIMEOUT');
+    }
+    if (res.data?.code === 'BROKER_REDIRECT_BLOCKED') {
       throw Error('TOKEN_BROKER_REDIRECT_BLOCKED');
     }
-    const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
-    if (!res.ok || !body?.ok || !body.token) {
-      const code = typeof body?.code === 'string' ? body.code : 'TOKEN_BROKER_UNAVAILABLE';
+    if (!res.ok || !res.data || res.data.ok !== true || !isPlainObject(res.data.token)) {
+      const code = typeof res.data?.code === 'string' ? res.data.code : 'TOKEN_BROKER_UNAVAILABLE';
       if (code.includes('REVOKED')) throw Error('TOKEN_REVOKED');
       if (code.includes('PERMISSION') || code.includes('MISMATCH') || code.includes('DEVICE')) {
         throw Error(`TOKEN_${code}`);
       }
       throw Error('TOKEN_BROKER_UNAVAILABLE');
     }
-    return body.token as {
-      token: string;
-      tokenType: 'installation';
-      installationId: string;
-      repositoryId?: number;
-      repositories: string[];
-      permissions: Record<string, string>;
-      issuedAtMs: number;
-      expiresAtMs: number;
+
+    const rawTok = res.data.token;
+    const tokStr = typeof rawTok.token === 'string' ? rawTok.token.trim() : '';
+    if (tokStr.length < 8) {
+      throw Error('TOKEN_VALUE_INVALID');
+    }
+    if (rawTok.tokenType !== 'installation') {
+      throw Error('TOKEN_TYPE_INVALID');
+    }
+    const expectedInstall = this.config.installationId ?? request.installationId;
+    if (rawTok.installationId !== expectedInstall) {
+      throw Error('TOKEN_INSTALLATION_MISMATCH');
+    }
+    const expectedRepo = this.config.repository ?? request.repository;
+    if (
+      !Array.isArray(rawTok.repositories) ||
+      rawTok.repositories.length !== 1 ||
+      !isValidRepoName(rawTok.repositories[0]) ||
+      rawTok.repositories[0].toLowerCase() !== expectedRepo.toLowerCase()
+    ) {
+      throw Error('TOKEN_REPOSITORY_SCOPE_MISMATCH');
+    }
+    const expectedRepoId = this.config.repositoryId ?? request.repositoryId;
+    if (
+      typeof rawTok.repositoryId !== 'number' ||
+      !Number.isSafeInteger(rawTok.repositoryId) ||
+      rawTok.repositoryId <= 0 ||
+      (expectedRepoId !== undefined && expectedRepoId > 0 && rawTok.repositoryId !== expectedRepoId)
+    ) {
+      throw Error('TOKEN_REPOSITORY_ID_MISMATCH');
+    }
+    const now = (this.config.nowMs ?? Date.now)();
+    if (
+      typeof rawTok.issuedAtMs !== 'number' ||
+      typeof rawTok.expiresAtMs !== 'number' ||
+      !Number.isFinite(rawTok.issuedAtMs) ||
+      !Number.isFinite(rawTok.expiresAtMs) ||
+      rawTok.expiresAtMs <= rawTok.issuedAtMs ||
+      rawTok.issuedAtMs > now + 5_000 ||
+      now >= rawTok.expiresAtMs
+    ) {
+      throw Error('TOKEN_TIMESTAMPS_INVALID');
+    }
+    if (!isPlainObject(rawTok.permissions)) {
+      throw Error('TOKEN_PERMISSIONS_INVALID');
+    }
+    const permEntries = Object.entries(rawTok.permissions);
+    if (permEntries.length === 0) {
+      throw Error('TOKEN_PERMISSIONS_INVALID');
+    }
+    const cleanPerms: Record<string, string> = {};
+    for (const [scope, level] of permEntries) {
+      if ((scope === 'contents' || scope === 'push') && level === 'write') {
+        throw Error('TOKEN_DESKTOP_WRITE_TOKEN_FORBIDDEN');
+      }
+      if (!ALLOWED_TOKEN_PERM_SCOPES.has(scope) || level !== 'read') {
+        throw Error('TOKEN_PERMISSION_ELEVATION_FORBIDDEN');
+      }
+      cleanPerms[scope] = level;
+    }
+
+    return {
+      token: tokStr,
+      tokenType: 'installation',
+      installationId: rawTok.installationId,
+      repositoryId: rawTok.repositoryId,
+      repositories: [rawTok.repositories[0]],
+      permissions: cleanPerms,
+      issuedAtMs: rawTok.issuedAtMs,
+      expiresAtMs: rawTok.expiresAtMs,
     };
   }
 
@@ -381,10 +614,24 @@ export class SandboxHttpTokenBrokerClient {
       return { status: 'UNKNOWN', code: 'TOKEN_REVOCATION_UNAVAILABLE' };
     }
     const p = verified.payload;
-    if (p.nonce !== nonce || p.token_sha256 !== tokenSha) {
+    if (Object.keys(p).sort().join(',') !== TOKEN_STATUS_REQUIRED_KEYS.join(',')) {
       return { status: 'UNKNOWN', code: 'TOKEN_REVOCATION_UNAVAILABLE' };
     }
-    if (p.status === 'REVOKED' || p.revoked === true) {
+    if (
+      typeof p.nonce !== 'string' ||
+      !STATUS_NONCE_RE.test(p.nonce) ||
+      p.nonce !== nonce ||
+      this.seenStatusNonces.has(p.nonce) ||
+      typeof p.token_sha256 !== 'string' ||
+      !SHA256_HEX_RE.test(p.token_sha256) ||
+      p.token_sha256 !== tokenSha ||
+      typeof p.revoked !== 'boolean'
+    ) {
+      return { status: 'UNKNOWN', code: 'TOKEN_REVOCATION_UNAVAILABLE' };
+    }
+    this.recordStatusNonce(p.nonce);
+
+    if (p.status === 'REVOKED' && p.revoked === true) {
       return { status: 'REVOKED', code: 'TOKEN_REVOKED' };
     }
     if (p.status === 'ACTIVE' && p.revoked === false) {
@@ -420,6 +667,18 @@ export class SandboxHttpTokenBrokerClient {
     commitMessage: string;
     treeSha: string;
   }): Promise<ServerMediatedLedgerOpResult> {
+    if (!ALLOWED_MEDIATED_OPS.has(input.operation)) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_ARBITRARY_PROXY_FORBIDDEN' };
+    }
+    if (
+      (this.config.workerId !== undefined && input.workerId !== this.config.workerId) ||
+      (this.config.installationId !== undefined && input.installationId !== this.config.installationId) ||
+      !isValidRepoName(input.repository) ||
+      (this.config.repository !== undefined && input.repository.toLowerCase() !== this.config.repository.toLowerCase()) ||
+      (this.config.repositoryId !== undefined && input.repositoryId !== this.config.repositoryId)
+    ) {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
+    }
     const assertion = this.config.deviceSigner.signDeviceAssertion({
       worker_id: input.workerId,
       device_id: this.config.deviceId,
@@ -458,10 +717,13 @@ export class SandboxHttpTokenBrokerClient {
       res.data.ok === true &&
       (status === 'COMMITTED' || status === 'ALREADY_EXISTS')
     ) {
+      if (typeof res.data.sha !== 'string' || !SHA40_RE.test(res.data.sha)) {
+        return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_RESPONSE_INVALID' };
+      }
       return {
         ok: true,
         status,
-        sha: typeof res.data.sha === 'string' ? res.data.sha : null,
+        sha: res.data.sha,
       };
     }
     if (status === 'CONFLICT') {

@@ -11,9 +11,10 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash, generateKeyPairSync, webcrypto } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign as cryptoSign, webcrypto } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -682,6 +683,433 @@ test('F4.1 operational CLI E2E: controller:cli start runs V2 + mediated CAS + re
     assert.equal((await revokedStatusRes.json()).code, 'EXEC_REQ_DEVICE_REVOKED');
   } finally {
     await stopProc(daemonProc);
+    await stopProc(brokerProc);
+    if (bridgeConn?.port?.disconnect) {
+      bridgeConn.port.disconnect();
+    }
+    await stopProc(entryProc);
+    await mockGh.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('F4.2-04 integrated CLI subprocess: validly broker-signed ACTIVE status omitting repository fails closed (503) with zero claims, zero sends, and zero receipts before Turn 1 -> Turn 2 passes', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bke-f42-cli-e2e-'));
+  await chmod(dir, 0o700);
+  const mockGh = await startMockGitHubServer({ installationId: INSTALL_ID });
+  const adminKeys = genEd25519();
+  const adminKeyFile = join(dir, 'admin-keys.json');
+  const enrollmentPath = join(dir, 'enrollment.json');
+  const brokerStatePath = join(dir, 'broker-state.json');
+  const policyPath = join(dir, 'owner-policy.json');
+  const credsPath = join(dir, 'device-credentials.json');
+  const sockPath = join(dir, 'bridge.sock');
+  const journalPath = join(dir, 'journal.json');
+
+  await writeFile(adminKeyFile, JSON.stringify({ 'admin-k1': adminKeys.publicPem }), { mode: 0o600 });
+
+  let brokerProc = null;
+  let proxyServer = null;
+  let daemonProc = null;
+  let entryProc = null;
+  let bridgeConn = null;
+
+  try {
+    brokerProc = spawn(process.execPath, [brokerServerPath], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        PATH: process.env.PATH ?? '',
+        BKE_BROKER_ISSUER: ISSUER,
+        BKE_BROKER_PORT: '0',
+        BKE_BROKER_ENROLLMENT_PATH: enrollmentPath,
+        BKE_BROKER_STATE_PATH: brokerStatePath,
+        BKE_GITHUB_API_BASE_URL: mockGh.baseUrl,
+        BKE_BROKER_ADMIN_PUBLIC_KEYS_FILE: adminKeyFile,
+        BKE_PINNED_APP_ID: '9001',
+        BKE_PINNED_APP_SLUG: 'bke-dispatcher-app',
+      },
+    });
+    const brokerBoot = await waitFirstLine(brokerProc);
+    assert.equal(brokerBoot.ok, true);
+    const realBrokerUrl = `http://127.0.0.1:${brokerBoot.port}`;
+
+    // Read genuine broker active execution signing key to re-sign tampered ACTIVE status omitting repository
+    const brokerState = JSON.parse(await readFile(brokerStatePath, 'utf8'));
+    const activeExecKey = brokerState.signingKeys.find((k) => k.role === 'EXECUTION' && k.status === 'ACTIVE');
+    assert.ok(activeExecKey?.private_key_pem);
+
+    let tamperMode = 'OMIT_REPO_SIGNED';
+    proxyServer = createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+      const upstream = await fetch(`${realBrokerUrl}${req.url}`, {
+        method: req.method,
+        headers: { 'Content-Type': 'application/json' },
+        body: req.method === 'GET' ? undefined : rawBody,
+      });
+      const json = await upstream.json();
+      if (req.url === '/v1/enrollment/status' && tamperMode === 'OMIT_REPO_SIGNED' && json.signed_status?.payload) {
+        const tamperedPayload = { ...json.signed_status.payload };
+        delete tamperedPayload.repository;
+        const ordered = {};
+        for (const k of Object.keys(tamperedPayload).sort()) ordered[k] = tamperedPayload[k];
+        const sig = cryptoSign(
+          null,
+          Buffer.from('BKE_DEVICE_STATUS_V1\n' + JSON.stringify(ordered), 'utf8'),
+          activeExecKey.private_key_pem,
+        ).toString('base64url');
+        json.signed_status = {
+          payload: tamperedPayload,
+          signature_alg: 'Ed25519',
+          key_id: activeExecKey.key_id,
+          signature_b64url: sig,
+        };
+      }
+      res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(json));
+    });
+    await new Promise((r) => proxyServer.listen(0, '127.0.0.1', r));
+    const proxyBrokerUrl = `http://127.0.0.1:${proxyServer.address().port}`;
+
+    const { publicKey: devPub, privateKey: devPriv } = generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+    const devPubPem = devPub.export({ type: 'spki', format: 'pem' }).toString();
+    const devPrivPem = devPriv.export({ type: 'pkcs8', format: 'pem' }).toString();
+    const devPubSha = createHash('sha256').update(devPub.export({ type: 'spki', format: 'der' })).digest('hex');
+    const deviceSigner = new DeviceKeyPairSigner({ publicKeySpkiPem: devPubPem, privateKeyPem: devPrivPem });
+
+    const now = Date.now();
+    const mkAdmin = (action, extra = {}) =>
+      signAdminApproval(
+        {
+          version: 1,
+          action,
+          admin_actor_id: 'owner-admin-01',
+          installation_id: INSTALL_ID,
+          worker_id: WORKER,
+          device_id: DEVICE_ID,
+          authorized_repository_scope: [REPO],
+          pr_number: PR_NUM,
+          head_sha: HEAD_A,
+          nonce: `adm-${Math.random().toString(16).slice(2)}`,
+          issued_at: new Date(now - 2_000).toISOString(),
+          expires_at: new Date(now + 180_000).toISOString(),
+          ...extra,
+        },
+        adminKeys.privatePem,
+        'admin-k1',
+      );
+
+    const chRes = await fetch(`${realBrokerUrl}/v1/enrollment/challenge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        installation_id: INSTALL_ID,
+        worker_id: WORKER,
+        device_id: DEVICE_ID,
+        authorized_repository_scope: [REPO],
+        admin_approval: mkAdmin('APPROVE_ENROLLMENT'),
+      }),
+    });
+    assert.equal(chRes.status, 200);
+    const { challenge } = await chRes.json();
+
+    const compRes = await fetch(`${realBrokerUrl}/v1/enrollment/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        challenge_id: challenge.challenge_id,
+        installation_id: INSTALL_ID,
+        worker_id: WORKER,
+        device_id: DEVICE_ID,
+        public_key_spki_pem: devPubPem,
+        browser_profile_identity: PROFILE_BINDING,
+        native_bridge_identity: RESOURCES.bridge_identity_sha256,
+        challenge_signature_b64url: deviceSigner.signEnrollmentChallenge({
+          challenge,
+          browser_profile_identity: PROFILE_BINDING,
+          native_bridge_identity: RESOURCES.bridge_identity_sha256,
+        }),
+      }),
+    });
+    assert.equal(compRes.status, 200);
+
+    const identity = createDeviceIdentityBridge({
+      store: memoryIdentityStore(),
+      cryptoImpl: webcrypto,
+      now: () => Date.now(),
+    });
+    const pub = await identity.initialize(WORKER);
+    await writeFile(
+      policyPath,
+      JSON.stringify({
+        version: 1,
+        allowed_origin: ORIGIN,
+        worker_id: WORKER,
+        public_key_sha256: pub.public_key_sha256,
+        profile_binding_sha256: PROFILE_BINDING,
+        resources: RESOURCES,
+        expires_at_ms: Date.now() + 180_000,
+      }),
+      { mode: 0o600 },
+    );
+
+    await writeFile(
+      credsPath,
+      JSON.stringify({
+        version: 1,
+        device_id: DEVICE_ID,
+        worker_id: WORKER,
+        installation_id: INSTALL_ID,
+        repository: REPO,
+        repository_id: REPO_ID,
+        enrollment_generation: 1,
+        device_public_key_pem: devPubPem,
+        device_private_key_pem: devPrivPem,
+        public_key_sha256: devPubSha,
+        browser_profile_identity: PROFILE_BINDING,
+        native_bridge_identity: RESOURCES.bridge_identity_sha256,
+        extension_public_key_sha256: pub.public_key_sha256,
+        broker_issuer: ISSUER,
+        broker_base_url: proxyBrokerUrl,
+        broker_public_keys_by_id: brokerBoot.executionPublicKeys,
+        halt_public_keys_by_id: brokerBoot.haltPublicKeys,
+      }),
+      { mode: 0o600 },
+    );
+
+    const browserState = {
+      url: 'https://chatgpt.com/',
+      uiState: 'NEW_CHAT_LANDING',
+      tabId: 42,
+      targetId: 'target-f42-cli-01',
+      profileId: 'profile-f42-cli-01',
+      submissions: [],
+    };
+    const runtime = {
+      getURL: () => ORIGIN,
+      connectNative() {
+        entryProc = spawn(process.execPath, [entryPath, '--controller-bridge', policyPath, ORIGIN, sockPath], {
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { PATH: process.env.PATH ?? '' },
+        });
+        const msgListeners = new Set();
+        const discListeners = new Set();
+        let buffer = Buffer.alloc(0);
+        const notifyDisc = () => {
+          for (const fn of [...discListeners]) fn();
+        };
+        entryProc.stdout.on('data', (chunk) => {
+          buffer = Buffer.concat([buffer, chunk]);
+          while (buffer.length >= 4) {
+            const len = buffer.readUInt32LE(0);
+            if (buffer.length < len + 4) break;
+            const msg = JSON.parse(buffer.subarray(4, len + 4).toString('utf8'));
+            buffer = buffer.subarray(len + 4);
+            for (const fn of [...msgListeners]) fn(msg);
+          }
+        });
+        entryProc.once('exit', notifyDisc);
+        return {
+          postMessage(msg) {
+            const body = Buffer.from(JSON.stringify(msg), 'utf8');
+            const frame = Buffer.allocUnsafe(body.length + 4);
+            frame.writeUInt32LE(body.length, 0);
+            body.copy(frame, 4);
+            entryProc.stdin.write(frame);
+          },
+          disconnect() {
+            if (!entryProc.stdin.writableEnded) entryProc.stdin.end();
+          },
+          onMessage: { addListener: (fn) => msgListeners.add(fn), removeListener: (fn) => msgListeners.delete(fn) },
+          onDisconnect: { addListener: (fn) => discListeners.add(fn), removeListener: (fn) => discListeners.delete(fn) },
+        };
+      },
+    };
+
+    let lastClock = 0;
+    const nextIso = () => {
+      lastClock = Math.max(Date.now(), lastClock + 10);
+      return new Date(lastClock).toISOString();
+    };
+    bridgeConn = await connectControllerNativeBridge({
+      runtime,
+      identity,
+      workerId: WORKER,
+      resources: RESOURCES,
+      profileBindingSha256: PROFILE_BINDING,
+      checkPermission: async () => true,
+      cryptoImpl: webcrypto,
+      handlers: {
+        withTargetLock: async (run) => ({ ok: true, value: await run() }),
+        getTargetStatus: async () => ({
+          ok: true,
+          code: 'TARGET_OK',
+          payload: {
+            observedAt: nextIso(),
+            url: browserState.url,
+            visible: true,
+            composerAvailable: true,
+            turnBusy: false,
+            uiState: browserState.uiState,
+            tabId: browserState.tabId,
+            targetId: browserState.targetId,
+            profileId: browserState.profileId,
+            matchingWritableTargetCount: 1,
+            sharedWritableProfile: false,
+          },
+        }),
+        dispatchFirstMessage: async (cmd) => {
+          const beforeUrl = browserState.url;
+          const convId = 'conv-f42-cli-01';
+          const afterUrl = `https://chatgpt.com/c/${convId}`;
+          browserState.submissions.push({ turn: 1, attemptId: cmd.attempt_id, prompt: cmd.prompt, convId });
+          browserState.url = afterUrl;
+          browserState.uiState = 'THREAD';
+          return {
+            ok: true,
+            code: 'FIRST_MESSAGE_SENT',
+            payload: { beforeUrl, afterUrl, conversationId: convId, sendStartedAt: nextIso(), confirmedAt: nextIso() },
+          };
+        },
+        dispatchContinuation: async (cmd) => {
+          const beforeUrl = browserState.url;
+          const afterUrl = `https://chatgpt.com/c/${cmd.expected_conversation_id}`;
+          browserState.submissions.push({ turn: cmd.expected_turn_number, attemptId: cmd.attempt_id, prompt: cmd.prompt });
+          return {
+            ok: true,
+            code: 'CONTINUATION_SENT',
+            payload: {
+              beforeUrl,
+              afterUrl,
+              conversationId: cmd.expected_conversation_id,
+              sendStartedAt: nextIso(),
+              confirmedAt: nextIso(),
+            },
+          };
+        },
+      },
+    });
+    assert.equal(bridgeConn.ok, true);
+
+    daemonProc = spawn(process.execPath, [controllerCliPath, 'start', '--owner-supervised-live-send'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        PATH: process.env.PATH ?? '',
+        BKE_REPOSITORY: REPO,
+        BKE_PR_NUMBER: String(PR_NUM),
+        BKE_WORKER_ID: WORKER,
+        BKE_PINNED_APP_ID: '9001',
+        BKE_PINNED_APP_SLUG: 'bke-dispatcher-app',
+        BKE_EXECUTION_ID: 'exec-f42-cli-01',
+        BKE_TARGET_ID: browserState.targetId,
+        BKE_PROFILE_ID: browserState.profileId,
+        BKE_TARGET_TAB_ID: String(browserState.tabId),
+        BKE_JOURNAL_PATH: journalPath,
+        BKE_CONTROLLER_IPC_SOCKET: sockPath,
+        BKE_NATIVE_POLICY_PATH: policyPath,
+        BKE_DEVICE_CREDENTIALS_PATH: credsPath,
+        BKE_OPERATOR_HALT_TOKEN: 'halt-secret-f42-01',
+        BKE_CONTROLLER_HOST: '127.0.0.1',
+        BKE_CONTROLLER_PORT: '0',
+        BKE_EXECUTION_ENVELOPE_ENABLED: 'true',
+        BKE_EXECUTION_V2_ASYMMETRIC_ENABLED: 'true',
+        BKE_REQUIRE_ASYMMETRIC_V2: 'true',
+        BKE_SERVER_MEDIATED_CAS_ENABLED: 'true',
+        BKE_REMOTE_BROKER_ENABLED: 'true',
+        BKE_BROKER_BASE_URL: proxyBrokerUrl,
+        BKE_EXECUTION_AUDIENCE: AUDIENCE,
+        BKE_ALLOW_REMOTE_SIGNED_HALT: 'true',
+        BKE_GITHUB_API_BASE_URL: mockGh.baseUrl,
+        BKE_CERT_GITHUB_CAS: 'true',
+        BKE_CERT_NATIVE_PAIRING: 'true',
+        BKE_CERT_REAL_BROWSER: 'true',
+        BKE_OWNER_SUPERVISED_LIVE_SEND: 'I_OWNER_AUTHORIZE_LIVE_SEND',
+      },
+    });
+    const daemonBoot = await waitFirstLine(daemonProc);
+    assert.equal(daemonBoot.ok, true);
+    const daemonUrl = `http://127.0.0.1:${daemonBoot.port}`;
+
+    const authorizeAtBroker = async (attemptId, action) => {
+      mockGh.setTicket(REPO, HEAD_A, WORKER, attemptId, Date.now() + 180_000);
+      const res = await fetch(`${realBrokerUrl}/v1/broker/authorize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repository: REPO,
+          expected_repository_id: REPO_ID,
+          installation_id: INSTALL_ID,
+          worker_id: WORKER,
+          pr_number: PR_NUM,
+          head_sha: HEAD_A,
+          attempt_id: attemptId,
+          action,
+          device_assertion: deviceSigner.signDeviceAssertion({
+            worker_id: WORKER,
+            device_id: DEVICE_ID,
+            installation_id: INSTALL_ID,
+            enrollment_generation: 1,
+            purpose: 'AUTHORIZE_EXECUTION',
+            repository: REPO,
+          }),
+          admin_approval: mkAdmin('DISPATCH_EXECUTION', { attempt_id: attemptId, execution_action: action }),
+        }),
+      });
+      const body = await res.json();
+      assert.equal(res.status, 200);
+      return body.signed_request;
+    };
+
+    // 1. Negative integrated proof: validly broker-signed ACTIVE status omitting `repository`
+    const reqBlocked = await authorizeAtBroker('att-f42-omit-repo', 'DISPATCH_FIRST_MESSAGE');
+    const blockedRes = await fetch(`${daemonUrl}/execution-requests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reqBlocked),
+    });
+    assert.equal(blockedRes.status, 503);
+    const blockedBody = await blockedRes.json();
+    assert.equal(blockedBody.ok, false);
+    assert.equal(blockedBody.status, 'BLOCKED');
+    assert.equal(blockedBody.code, 'EXEC_REQ_REVOCATION_UNAVAILABLE');
+    assert.equal(blockedBody.submitInvocations, 0);
+    assert.equal(blockedBody.journalPhase, 'IDLE');
+    assert.equal(browserState.submissions.length, 0);
+    assert.equal(mockGh.state.refs.size, 0);
+    assert.equal(mockGh.state.commits.size, 1);
+    assert.equal(mockGh.state.commitSeq, 1);
+    assert.equal(mockGh.state.requestLog.some((r) => r.method === 'POST' && r.path.includes('/git/')), false);
+    assert.ok(!JSON.stringify(blockedBody).includes('PRIVATE KEY'));
+    assert.ok(!JSON.stringify(blockedBody).includes('ghs_'));
+
+    // 2. Positive Turn 1 -> Turn 2 via same live CLI subprocess once proxy stops stripping `repository`
+    tamperMode = 'PASS_THROUGH';
+    const reqT1 = await authorizeAtBroker('att-f42-turn-1', 'DISPATCH_FIRST_MESSAGE');
+    const t1Res = await fetch(`${daemonUrl}/execution-requests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reqT1),
+    });
+    assert.equal(t1Res.status, 200);
+    const t1Body = await t1Res.json();
+    assert.equal(t1Body.status, 'CONFIRMED_TURN_1');
+    assert.equal(t1Body.conversationId, 'conv-f42-cli-01');
+
+    const reqT2 = await authorizeAtBroker('att-f42-turn-2', 'DISPATCH_CONTINUATION');
+    const t2Res = await fetch(`${daemonUrl}/execution-requests`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(reqT2),
+    });
+    assert.equal(t2Res.status, 200);
+    const t2Body = await t2Res.json();
+    assert.equal(t2Body.status, 'CONFIRMED_CONTINUATION');
+    assert.equal(t2Body.turnNumber, 2);
+    assert.equal(browserState.submissions.length, 2);
+  } finally {
+    await stopProc(daemonProc);
+    await new Promise((r) => (proxyServer ? proxyServer.close(() => r()) : r()));
     await stopProc(brokerProc);
     if (bridgeConn?.port?.disconnect) {
       bridgeConn.port.disconnect();

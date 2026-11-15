@@ -3,9 +3,9 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { generateKeyPairSync } from 'node:crypto';
+import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -506,6 +506,23 @@ test('F4 P0-02: Ed25519 Signed HTTP Revocation & Token Status checks fail closed
     const { port: realPort } = await httpBroker.start();
     const pubKeys = await broker.getPublicVerificationKeys();
 
+    const brokerState = JSON.parse(await readFile(join(dir, 'broker.json'), 'utf8'));
+    const activeExecKey = brokerState.signingKeys.find((k) => k.role === 'EXECUTION' && k.status === 'ACTIVE');
+    const resignStatus = (domain, payloadObj) => {
+      const ordered = {};
+      for (const k of Object.keys(payloadObj).sort()) ordered[k] = payloadObj[k];
+      return {
+        payload: payloadObj,
+        signature_alg: 'Ed25519',
+        key_id: activeExecKey.key_id,
+        signature_b64url: cryptoSign(
+          null,
+          Buffer.from(domain + JSON.stringify(ordered), 'utf8'),
+          activeExecKey.private_key_pem,
+        ).toString('base64url'),
+      };
+    };
+
     // Fault-injecting proxy sitting in front of the real SandboxBrokerHttpServer
     let faultMode = 'PASS_THROUGH';
     proxyServer = createServer(async (req, res) => {
@@ -545,6 +562,7 @@ test('F4 P0-02: Ed25519 Signed HTTP Revocation & Token Status checks fail closed
       const json = await upstream.json();
 
       if ((req.url === '/v1/enrollment/status' || req.url === '/v1/broker/token-status') && json.signed_status) {
+        const domain = req.url === '/v1/enrollment/status' ? 'BKE_DEVICE_STATUS_V1\n' : 'BKE_TOKEN_STATUS_V1\n';
         if (faultMode === 'UNSIGNED') {
           delete json.signed_status;
         } else if (faultMode === 'BAD_SIG') {
@@ -552,16 +570,46 @@ test('F4 P0-02: Ed25519 Signed HTTP Revocation & Token Status checks fail closed
         } else if (faultMode === 'WRONG_KEY_ID') {
           json.signed_status.key_id = 'rogue-k99';
         } else if (faultMode === 'WRONG_NONCE') {
-          // Signed payload with wrong nonce using rogue or broken signature -> caught by sig or nonce
-          json.signed_status.payload.nonce = 'replayed-stale-nonce';
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, nonce: 'replayed-stale-nonce' });
         } else if (faultMode === 'EXPIRED') {
-          json.signed_status.payload.expires_at = new Date(now - 5_000).toISOString();
+          json.signed_status = resignStatus(domain, {
+            ...json.signed_status.payload,
+            issued_at: new Date(now - 60_000).toISOString(),
+            expires_at: new Date(now - 5_000).toISOString(),
+          });
         } else if (faultMode === 'WRONG_ISSUER') {
-          json.signed_status.payload.broker_issuer = 'https://evil-broker.example';
+          json.signed_status = resignStatus(domain, {
+            ...json.signed_status.payload,
+            broker_issuer: 'https://evil-broker.example',
+          });
         } else if (faultMode === 'WRONG_DEVICE') {
-          json.signed_status.payload.device_id = 'other-device';
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, device_id: 'other-device' });
         } else if (faultMode === 'WRONG_GEN') {
-          json.signed_status.payload.actual_enrollment_generation = 99;
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, actual_enrollment_generation: 99 });
+        } else if (faultMode === 'SIGNED_OMIT_REPO') {
+          const p = { ...json.signed_status.payload };
+          delete p.repository;
+          json.signed_status = resignStatus(domain, p);
+        } else if (faultMode === 'SIGNED_WRONG_REPO') {
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, repository: 'other/repo' });
+        } else if (faultMode === 'SIGNED_OMIT_TOKEN_HASH') {
+          const p = { ...json.signed_status.payload };
+          delete p.token_sha256;
+          json.signed_status = resignStatus(domain, p);
+        } else if (faultMode === 'SIGNED_WRONG_TOKEN_HASH') {
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, token_sha256: 'f'.repeat(64) });
+        } else if (faultMode === 'SIGNED_STATUS_UNKNOWN') {
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, status: 'UNKNOWN', revoked: false });
+        } else if (faultMode === 'SIGNED_CONTRADICTORY_ACTIVE') {
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, status: 'ACTIVE', revoked: true });
+        } else if (faultMode === 'SIGNED_EXTRA_FIELD') {
+          json.signed_status = resignStatus(domain, { ...json.signed_status.payload, extra_claim: 'tamper' });
+        } else if (faultMode === 'SIGNED_FUTURE_ISSUED') {
+          json.signed_status = resignStatus(domain, {
+            ...json.signed_status.payload,
+            issued_at: new Date(now + 20_000).toISOString(),
+            expires_at: new Date(now + 50_000).toISOString(),
+          });
         }
       }
       res.writeHead(upstream.status, { 'Content-Type': 'application/json' });
@@ -616,7 +664,7 @@ test('F4 P0-02: Ed25519 Signed HTTP Revocation & Token Status checks fail closed
     assert.equal(await client.isRevoked(minted.token), false);
 
     // Every single fault MUST return UNKNOWN / fail closed
-    const deviceFaults = [
+    const sharedFaults = [
       'HTTP_500',
       'REDIRECT_302',
       'TIMEOUT',
@@ -629,7 +677,12 @@ test('F4 P0-02: Ed25519 Signed HTTP Revocation & Token Status checks fail closed
       'WRONG_ISSUER',
       'WRONG_DEVICE',
       'WRONG_GEN',
+      'SIGNED_STATUS_UNKNOWN',
+      'SIGNED_CONTRADICTORY_ACTIVE',
+      'SIGNED_EXTRA_FIELD',
+      'SIGNED_FUTURE_ISSUED',
     ];
+    const deviceFaults = [...sharedFaults, 'SIGNED_OMIT_REPO', 'SIGNED_WRONG_REPO'];
     for (const mode of deviceFaults) {
       faultMode = mode;
       const d = await client.checkDeviceRevocation({
@@ -641,11 +694,50 @@ test('F4 P0-02: Ed25519 Signed HTTP Revocation & Token Status checks fail closed
       });
       assert.equal(d.status, 'UNKNOWN', `device fault ${mode} must yield UNKNOWN`);
       assert.equal(d.revoked, true, `device fault ${mode} must fail closed revoked=true`);
+    }
 
+    const tokenFaults = [
+      ...sharedFaults.filter((m) => m !== 'WRONG_DEVICE' && m !== 'WRONG_GEN'),
+      'SIGNED_OMIT_TOKEN_HASH',
+      'SIGNED_WRONG_TOKEN_HASH',
+    ];
+    for (const mode of tokenFaults) {
+      faultMode = mode;
       const t = await client.checkTokenStatus(minted.token);
       assert.equal(t.status, 'UNKNOWN', `token fault ${mode} must yield UNKNOWN`);
       await assert.rejects(() => client.isRevoked(minted.token), /TOKEN_REVOCATION_UNAVAILABLE/);
     }
+
+    // Server-side status nonce replay rejection and missing-nonce unsigned fallback removal
+    const replayNonce = 'status-replay-nonce-01';
+    const firstSigned = await broker.getSignedDeviceStatus({
+      workerId: WORKER,
+      deviceId: DEVICE,
+      installationId: INSTALL_ID,
+      repository: REPO,
+      enrollmentGeneration: 1,
+      nonce: replayNonce,
+    });
+    assert.equal(firstSigned.payload.status, 'ACTIVE');
+    await assert.rejects(
+      () =>
+        broker.getSignedDeviceStatus({
+          workerId: WORKER,
+          deviceId: DEVICE,
+          installationId: INSTALL_ID,
+          repository: REPO,
+          enrollmentGeneration: 1,
+          nonce: replayNonce,
+        }),
+      /BROKER_NONCE_REPLAYED/,
+    );
+    const noNonceHttp = await fetch(`http://127.0.0.1:${realPort}/v1/enrollment/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ worker_id: WORKER, device_id: DEVICE }),
+    });
+    assert.equal(noNonceHttp.status, 400);
+    assert.equal((await noNonceHttp.json()).code, 'BROKER_STATUS_NONCE_INVALID');
 
     // Wrong generation (< and >) when PASS_THROUGH returns REVOKED with generation mismatch/stale
     faultMode = 'PASS_THROUGH';

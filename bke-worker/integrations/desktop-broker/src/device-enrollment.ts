@@ -624,11 +624,34 @@ export class DeviceEnrollmentRegistry {
     if (assertion.signature_alg !== 'ES256' || typeof assertion.signature_b64url !== 'string') {
       throw Error('DEVICE_ASSERTION_ALG_INVALID');
     }
-    const p = assertion.payload;
-    if (!p || typeof p !== 'object' || p.purpose !== expectedPurpose) {
+    const rawPayload = assertion.payload as unknown;
+    if (!rawPayload || typeof rawPayload !== 'object' || Array.isArray(rawPayload)) {
+      throw Error('DEVICE_ASSERTION_INVALID');
+    }
+    const pObj = rawPayload as Record<string, unknown>;
+    if (
+      Object.keys(pObj).sort().join(',') !==
+        'device_id,enrollment_generation,expires_at,installation_id,issued_at,nonce,purpose,repository,worker_id' ||
+      typeof pObj.worker_id !== 'string' ||
+      typeof pObj.device_id !== 'string' ||
+      typeof pObj.installation_id !== 'string' ||
+      typeof pObj.enrollment_generation !== 'number' ||
+      !Number.isSafeInteger(pObj.enrollment_generation) ||
+      typeof pObj.purpose !== 'string' ||
+      typeof pObj.repository !== 'string' ||
+      typeof expectedRepository !== 'string' ||
+      typeof pObj.nonce !== 'string' ||
+      pObj.nonce.length < 8 ||
+      typeof pObj.issued_at !== 'string' ||
+      typeof pObj.expires_at !== 'string'
+    ) {
+      throw Error('DEVICE_ASSERTION_INVALID');
+    }
+    const p = rawPayload as DeviceSignedAssertionPayload;
+    if (p.purpose !== expectedPurpose) {
       throw Error('DEVICE_ASSERTION_PURPOSE_MISMATCH');
     }
-    if (p.repository.toLowerCase() !== expectedRepository.toLowerCase()) {
+    if (!REPO_RE.test(p.repository) || p.repository.toLowerCase() !== expectedRepository.toLowerCase()) {
       throw Error('DEVICE_ASSERTION_REPOSITORY_MISMATCH');
     }
 
@@ -677,6 +700,12 @@ export class DeviceEnrollmentRegistry {
     code?: string;
     device: EnrolledDeviceRecord | null;
   }> {
+    if (typeof info.workerId !== 'string' || !WORKER_RE.test(info.workerId)) {
+      return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_WORKER_MISMATCH', device: null };
+    }
+    if (info.deviceId !== undefined && (typeof info.deviceId !== 'string' || !info.deviceId)) {
+      return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_DEVICE_UNKNOWN', device: null };
+    }
     const state = await this.withFileLock(() => this.readStateOrCreate());
     const devId = info.deviceId ?? state.workerToDeviceId[info.workerId];
     if (!devId) return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_DEVICE_UNKNOWN', device: null };
@@ -687,25 +716,32 @@ export class DeviceEnrollmentRegistry {
     if (dev.worker_id !== info.workerId) {
       return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_WORKER_MISMATCH', device: dev };
     }
-    if (typeof info.installationId === 'string' && info.installationId && dev.installation_id !== info.installationId) {
+    if (info.installationId !== undefined && (typeof info.installationId !== 'string' || dev.installation_id !== info.installationId)) {
       return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_INSTALLATION_MISMATCH', device: dev };
     }
     if (
-      typeof info.repository === 'string' &&
-      info.repository &&
-      !dev.authorized_repository_scope.some((r) => r.toLowerCase() === info.repository!.toLowerCase())
+      info.repository !== undefined &&
+      (typeof info.repository !== 'string' ||
+        !REPO_RE.test(info.repository) ||
+        !dev.authorized_repository_scope.some((r) => r.toLowerCase() === info.repository!.toLowerCase()))
     ) {
       return { status: 'REVOKED', revoked: true, code: 'DEVICE_REPOSITORY_UNAUTHORIZED', device: dev };
     }
-    if (
-      typeof info.enrollmentGeneration === 'number' &&
-      info.enrollmentGeneration !== dev.enrollment_generation
-    ) {
-      const code =
-        info.enrollmentGeneration < dev.enrollment_generation
-          ? 'EXEC_REQ_ENROLLMENT_STALE'
-          : 'EXEC_REQ_ENROLLMENT_GENERATION_MISMATCH';
-      return { status: 'REVOKED', revoked: true, code, device: dev };
+    if (info.enrollmentGeneration !== undefined) {
+      if (
+        typeof info.enrollmentGeneration !== 'number' ||
+        !Number.isSafeInteger(info.enrollmentGeneration) ||
+        info.enrollmentGeneration < 1
+      ) {
+        return { status: 'REVOKED', revoked: true, code: 'EXEC_REQ_ENROLLMENT_GENERATION_MISMATCH', device: dev };
+      }
+      if (info.enrollmentGeneration !== dev.enrollment_generation) {
+        const code =
+          info.enrollmentGeneration < dev.enrollment_generation
+            ? 'EXEC_REQ_ENROLLMENT_STALE'
+            : 'EXEC_REQ_ENROLLMENT_GENERATION_MISMATCH';
+        return { status: 'REVOKED', revoked: true, code, device: dev };
+      }
     }
     return { status: 'ACTIVE', revoked: false, device: structuredClone(dev) };
   }
