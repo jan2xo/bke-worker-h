@@ -75,7 +75,7 @@ export interface TokenLifecycleStatus {
   trustedRealBrokerApiAvailable: boolean;
   realBrokerTransportConnected: boolean;
   realGitHubAppRenewalCertified: boolean;
-  brokerKind: 'MOCK_BROKER' | 'REMOTE_DISABLED' | 'UNCONFIGURED';
+  brokerKind: 'MOCK_BROKER' | 'REMOTE_OWNER_CERTIFIED_BROKER' | 'REMOTE_DISABLED' | 'UNCONFIGURED';
   hasCachedToken: boolean;
   expiresAtMs: number | null;
   revoked: boolean;
@@ -160,7 +160,12 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
       trustedRealBrokerApiAvailable: Boolean(this.config.trustedRealBrokerApiAvailable),
       realBrokerTransportConnected: Boolean(this.config.realBrokerTransportConnected),
       realGitHubAppRenewalCertified: Boolean(this.config.realGitHubAppRenewalCertified),
-      brokerKind: this.broker.kind === 'MOCK_BROKER' ? 'MOCK_BROKER' : 'REMOTE_DISABLED',
+      brokerKind:
+        this.broker.kind === 'MOCK_BROKER'
+          ? 'MOCK_BROKER'
+          : this.config.trustedRealBrokerApiAvailable && this.config.realBrokerTransportConnected
+            ? 'REMOTE_OWNER_CERTIFIED_BROKER'
+            : 'REMOTE_DISABLED',
       hasCachedToken: valid,
       expiresAtMs: valid && this.cached ? this.cached.expiresAtMs : null,
       revoked: this.revokedFlag,
