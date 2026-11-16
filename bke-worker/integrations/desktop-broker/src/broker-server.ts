@@ -253,8 +253,12 @@ export class SandboxBrokerHttpServer {
         return;
       }
       if (path === '/v1/broker/revoke-token') {
-        await this.broker.revokeIssuedToken(String(body.token ?? ''));
-        sendJson(res, 200, { ok: true });
+        if (typeof body.token !== 'string' || !body.token.trim()) {
+          throw Error('BROKER_TOKEN_INVALID');
+        }
+        const localOnly = body.local_only === true;
+        const revRes = await this.broker.revokeIssuedToken(body.token, { localOnly });
+        sendJson(res, 200, revRes);
         return;
       }
       if (path === '/v1/broker/ledger-ops') {

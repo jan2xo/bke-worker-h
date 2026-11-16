@@ -108,6 +108,11 @@ export interface DeviceSignedAssertionPayload {
   nonce: string;
   issued_at: string;
   expires_at: string;
+  ledger_op?: ServerMediatedLedgerOpKind;
+  pr_number?: number;
+  head_sha?: string;
+  attempt_id?: string;
+  ref_name?: string;
 }
 
 export interface DeviceSignedAssertion {
@@ -172,7 +177,7 @@ export interface TokenStatusPayload {
   version: 1;
   broker_issuer: string;
   token_sha256: string;
-  status: 'ACTIVE' | 'REVOKED';
+  status: 'ACTIVE' | 'REVOKED' | 'EXPIRED' | 'UNKNOWN';
   revoked: boolean;
   nonce: string;
   issued_at: string;

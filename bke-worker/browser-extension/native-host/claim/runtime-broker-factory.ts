@@ -426,7 +426,17 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
     }
   }
 
-  private signDevicePop(purpose: 'MINT_SCOPED_TOKEN' | 'SERVER_MEDIATED_LEDGER_OP', repository: string) {
+  private signDevicePop(
+    purpose: 'MINT_SCOPED_TOKEN' | 'SERVER_MEDIATED_LEDGER_OP',
+    repository: string,
+    ledgerBind?: {
+      ledger_op: ServerMediatedLedgerOpInput['operation'];
+      pr_number: number;
+      head_sha: string;
+      attempt_id: string;
+      ref_name: string;
+    },
+  ) {
     const now = this.nowMs();
     const payload: Record<string, unknown> = {
       worker_id: this.config.workerId,
@@ -439,6 +449,16 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
       issued_at: new Date(now).toISOString(),
       expires_at: new Date(now + 60_000).toISOString(),
     };
+    if (purpose === 'SERVER_MEDIATED_LEDGER_OP') {
+      if (!ledgerBind) {
+        throw Error('DEVICE_ASSERTION_LEDGER_FIELDS_MISSING');
+      }
+      payload.ledger_op = ledgerBind.ledger_op;
+      payload.pr_number = ledgerBind.pr_number;
+      payload.head_sha = ledgerBind.head_sha;
+      payload.attempt_id = ledgerBind.attempt_id;
+      payload.ref_name = ledgerBind.ref_name;
+    }
     const msg = Buffer.from(DEVICE_POP_DOMAIN + canonicalJson(payload), 'utf8');
     const sig = cryptoSign('sha256', msg, {
       key: this.config.devicePrivateKeyPem,
@@ -811,6 +831,10 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
       permissions: cleanPerms,
       issuedAtMs: rawTok.issuedAtMs,
       expiresAtMs: rawTok.expiresAtMs,
+      ...(typeof rawTok.usageExpiresAtMs === 'number' ? { usageExpiresAtMs: rawTok.usageExpiresAtMs } : {}),
+      ...(typeof rawTok.providerExpiresAtMs === 'number'
+        ? { providerExpiresAtMs: rawTok.providerExpiresAtMs }
+        : {}),
     };
   }
 
@@ -851,6 +875,12 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
     if (p.status === 'REVOKED' && p.revoked === true) {
       return { status: 'REVOKED', code: 'TOKEN_REVOKED' };
     }
+    if (p.status === 'EXPIRED' && p.revoked === true) {
+      return { status: 'EXPIRED', code: 'TOKEN_EXPIRED' };
+    }
+    if (p.status === 'UNKNOWN' && p.revoked === true) {
+      return { status: 'UNKNOWN', code: 'TOKEN_UNKNOWN_OR_UNISSUED' };
+    }
     if (p.status === 'ACTIVE' && p.revoked === false) {
       return { status: 'ACTIVE' };
     }
@@ -878,7 +908,13 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
       return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }
 
-    const assertion = this.signDevicePop('SERVER_MEDIATED_LEDGER_OP', input.repository);
+    const assertion = this.signDevicePop('SERVER_MEDIATED_LEDGER_OP', input.repository, {
+      ledger_op: input.operation,
+      pr_number: input.prNumber,
+      head_sha: input.headSha,
+      attempt_id: input.attemptId,
+      ref_name: input.refName,
+    });
     const res = await this.postJsonWithTimeout('/v1/broker/ledger-ops', {
       worker_id: input.workerId,
       device_assertion: assertion,

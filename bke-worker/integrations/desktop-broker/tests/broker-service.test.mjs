@@ -619,6 +619,11 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
             purpose: 'SERVER_MEDIATED_LEDGER_OP',
             repository: REPO,
             nowMs: clock.now,
+            ledger_op: 'COMMIT_PRE_SEND_FENCE',
+            pr_number: PR_NUM,
+            head_sha: HEAD_A,
+            attempt_id: 'att-cas-01',
+            ref_name: `refs/bke/fences/${PR_NUM}/att-cas-01`,
           }),
           ledger_op: {
             operation: 'COMMIT_PRE_SEND_FENCE',
@@ -651,6 +656,11 @@ test('F3-03: 17-point broker security, V2 Ed25519 signing, rotation, replay, tim
             purpose: 'SERVER_MEDIATED_LEDGER_OP',
             repository: REPO,
             nowMs: clock.now,
+            ledger_op: 'COMMIT_PRE_SEND_FENCE',
+            pr_number: PR_NUM,
+            head_sha: HEAD_A,
+            attempt_id: 'att-evil',
+            ref_name: 'refs/heads/main',
           }),
           ledger_op: {
             operation: 'COMMIT_PRE_SEND_FENCE',

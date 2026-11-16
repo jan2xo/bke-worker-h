@@ -28,6 +28,14 @@ const DEVICE_ID_RE = /^[A-Za-z0-9._:-]{6,128}$/;
 const INSTALL_RE = /^[0-9]{1,20}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
+const SHA40_RE = /^[a-f0-9]{40}$/;
+const ATTEMPT_RE = /^[a-z0-9][a-z0-9-]{0,95}$/;
+const LEDGER_POP_OPS = new Set([
+  'COMMIT_PRE_SEND_FENCE',
+  'CONSUME_SEND_CLAIM',
+  'RECONCILE_CONVERSATION',
+  'MARK_DELIVERY_UNCERTAIN',
+]);
 const CHALLENGE_TTL_MS = 120_000;
 const MAX_CLOCK_SKEW_MS = 5_000;
 const FORBIDDEN_CLIENT_PRIVILEGE_KEYS = new Set([
@@ -629,9 +637,13 @@ export class DeviceEnrollmentRegistry {
       throw Error('DEVICE_ASSERTION_INVALID');
     }
     const pObj = rawPayload as Record<string, unknown>;
+    const actualKeys = Object.keys(pObj).sort().join(',');
+    const expectedKeys =
+      expectedPurpose === 'SERVER_MEDIATED_LEDGER_OP'
+        ? 'attempt_id,device_id,enrollment_generation,expires_at,head_sha,installation_id,issued_at,ledger_op,nonce,pr_number,purpose,ref_name,repository,worker_id'
+        : 'device_id,enrollment_generation,expires_at,installation_id,issued_at,nonce,purpose,repository,worker_id';
     if (
-      Object.keys(pObj).sort().join(',') !==
-        'device_id,enrollment_generation,expires_at,installation_id,issued_at,nonce,purpose,repository,worker_id' ||
+      actualKeys !== expectedKeys ||
       typeof pObj.worker_id !== 'string' ||
       typeof pObj.device_id !== 'string' ||
       typeof pObj.installation_id !== 'string' ||
@@ -644,6 +656,23 @@ export class DeviceEnrollmentRegistry {
       pObj.nonce.length < 8 ||
       typeof pObj.issued_at !== 'string' ||
       typeof pObj.expires_at !== 'string'
+    ) {
+      throw Error('DEVICE_ASSERTION_INVALID');
+    }
+    if (
+      expectedPurpose === 'SERVER_MEDIATED_LEDGER_OP' &&
+      (typeof pObj.ledger_op !== 'string' ||
+        !LEDGER_POP_OPS.has(pObj.ledger_op) ||
+        typeof pObj.pr_number !== 'number' ||
+        !Number.isSafeInteger(pObj.pr_number) ||
+        pObj.pr_number < 1 ||
+        typeof pObj.head_sha !== 'string' ||
+        !SHA40_RE.test(pObj.head_sha) ||
+        typeof pObj.attempt_id !== 'string' ||
+        !ATTEMPT_RE.test(pObj.attempt_id) ||
+        typeof pObj.ref_name !== 'string' ||
+        pObj.ref_name.length < 1 ||
+        pObj.ref_name.length > 256)
     ) {
       throw Error('DEVICE_ASSERTION_INVALID');
     }

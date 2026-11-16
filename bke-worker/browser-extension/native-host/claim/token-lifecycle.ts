@@ -55,10 +55,14 @@ export interface IssuedScopedToken {
   repositories: string[];
   permissions: Record<string, string>;
   issuedAtMs: number;
+  /** Application-enforced usage/refresh deadline (may be shorter than GitHub's provider expiry). */
   expiresAtMs: number;
+  usageExpiresAtMs?: number;
+  /** GitHub provider-enforced installation token expiry unless revoked via DELETE /installation/token. */
+  providerExpiresAtMs?: number;
 }
 
-export type TokenRevocationStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
+export type TokenRevocationStatus = 'ACTIVE' | 'REVOKED' | 'EXPIRED' | 'UNKNOWN';
 
 export interface TokenBrokerClient {
   readonly kind: 'MOCK_BROKER' | 'REMOTE_OWNER_CERTIFIED_BROKER';
@@ -204,6 +208,10 @@ export class ManagedTokenProvider implements ScopedTokenLifecycleProvider {
           this.cached = null;
           this.revokedFlag = true;
           throw Error('TOKEN_REVOKED');
+        }
+        if (status === 'EXPIRED') {
+          this.cached = null;
+          throw Error('TOKEN_EXPIRED');
         }
         if (status !== 'ACTIVE') {
           throw Error(code && code.startsWith('TOKEN_') ? code : 'TOKEN_REVOCATION_UNAVAILABLE');

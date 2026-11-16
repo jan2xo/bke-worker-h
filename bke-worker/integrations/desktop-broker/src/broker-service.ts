@@ -67,6 +67,20 @@ function isValidRepoName(value: unknown): value is string {
   return parts.length === 2 && parts[0] !== '.' && parts[0] !== '..' && parts[1] !== '.' && parts[1] !== '..';
 }
 
+export interface IssuedTokenRecord {
+  token_sha256: string;
+  installation_id: string;
+  repository: string;
+  repository_id: number;
+  worker_id: string;
+  device_id: string;
+  issued_at_ms: number;
+  usage_expires_at_ms: number;
+  provider_expires_at_ms: number;
+  revoked: boolean;
+  provider_revoked: boolean;
+}
+
 interface BrokerDurableState {
   version: 1;
   signingKeys: BrokerSigningKeyEntry[];
@@ -74,6 +88,7 @@ interface BrokerDurableState {
   usedStatusNonces?: string[];
   usedDeliveryIds: string[];
   revokedTokens: string[];
+  issuedTokens?: Record<string, IssuedTokenRecord>;
   auditSeq: number;
   auditEvents: BrokerAuditEvent[];
 }
@@ -195,6 +210,7 @@ export class TrustedDesktopBroker {
           usedStatusNonces: [],
           usedDeliveryIds: [],
           revokedTokens: [],
+          issuedTokens: {},
           auditSeq: 0,
           auditEvents: [],
         };
@@ -227,6 +243,9 @@ export class TrustedDesktopBroker {
     }
     if (!Array.isArray(parsed.usedStatusNonces)) {
       parsed.usedStatusNonces = [];
+    }
+    if (!parsed.issuedTokens || typeof parsed.issuedTokens !== 'object' || Array.isArray(parsed.issuedTokens)) {
+      parsed.issuedTokens = {};
     }
     return parsed;
   }
@@ -558,7 +577,11 @@ export class TrustedDesktopBroker {
     repositories: string[];
     permissions: Record<string, string>;
     issuedAtMs: number;
+    /** Application-enforced usage/refresh budget (GitHub honors bearer until providerExpiresAtMs unless revoked). */
     expiresAtMs: number;
+    usageExpiresAtMs: number;
+    providerExpiresAtMs: number;
+    revocationScope: 'LOCAL_AND_PROVIDER';
   }> {
     if (!isValidRepoName(params.repository)) {
       throw Error('BROKER_REPOSITORY_INVALID');
@@ -614,9 +637,34 @@ export class TrustedDesktopBroker {
     });
 
     const now = this.nowMs();
+    // Note: `boundedExp` (`usageExpiresAtMs`) is the broker/client usage budget; GitHub itself honors the IAT
+    // until `minted.expiresAtMs` (`providerExpiresAtMs`) unless actively revoked via DELETE /installation/token.
     const boundedExp = Math.min(minted.expiresAtMs, now + this.defaultTokenTtlMs);
+    const tokenSha = createHash('sha256').update(minted.token, 'utf8').digest('hex');
     await this.withFileLock(async () => {
       const state = await this.readOrInitState();
+      const issuedMap = state.issuedTokens ?? {};
+      issuedMap[tokenSha] = {
+        token_sha256: tokenSha,
+        installation_id: minted.installationId,
+        repository: params.repository,
+        repository_id: minted.repositoryId,
+        worker_id: device.worker_id,
+        device_id: device.device_id,
+        issued_at_ms: now,
+        usage_expires_at_ms: boundedExp,
+        provider_expires_at_ms: minted.expiresAtMs,
+        revoked: false,
+        provider_revoked: false,
+      };
+      const keys = Object.keys(issuedMap);
+      if (keys.length > 4096) {
+        const sorted = keys.sort((a, b) => issuedMap[a]!.issued_at_ms - issuedMap[b]!.issued_at_ms);
+        for (const k of sorted.slice(0, keys.length - 4096)) {
+          delete issuedMap[k];
+        }
+      }
+      state.issuedTokens = issuedMap;
       this.appendAudit(state, {
         operation: 'MINT_SCOPED_TOKEN',
         outcome: 'ALLOWED',
@@ -637,6 +685,9 @@ export class TrustedDesktopBroker {
       permissions: minted.permissions,
       issuedAtMs: now,
       expiresAtMs: boundedExp,
+      usageExpiresAtMs: boundedExp,
+      providerExpiresAtMs: minted.expiresAtMs,
+      revocationScope: 'LOCAL_AND_PROVIDER',
     };
   }
 
@@ -656,10 +707,16 @@ export class TrustedDesktopBroker {
       'SERVER_MEDIATED_LEDGER_OP',
       params.ledger_op.repository,
     );
+    const pop = params.device_assertion.payload;
     if (
       device.worker_id !== params.worker_id ||
       device.installation_id !== params.ledger_op.installation_id ||
-      (params.ledger_op.worker_id !== undefined && params.ledger_op.worker_id !== params.worker_id)
+      (params.ledger_op.worker_id !== undefined && params.ledger_op.worker_id !== params.worker_id) ||
+      pop.ledger_op !== params.ledger_op.operation ||
+      pop.pr_number !== params.ledger_op.pr_number ||
+      pop.head_sha !== params.ledger_op.head_sha ||
+      pop.attempt_id !== params.ledger_op.attempt_id ||
+      pop.ref_name !== params.ledger_op.ref_name
     ) {
       return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }
@@ -791,12 +848,32 @@ export class TrustedDesktopBroker {
         throw Error('BROKER_NONCE_REPLAYED');
       }
       state.usedStatusNonces = [...usedStatusNonces, params.nonce].slice(-2048);
-      const revoked = state.revokedTokens.includes(tokenSha);
+
+      const rec = state.issuedTokens?.[tokenSha];
+      const inRevokedList = state.revokedTokens.includes(tokenSha);
+
+      let status: TokenStatusPayload['status'];
+      let revoked: boolean;
+      if (inRevokedList || rec?.revoked === true) {
+        status = 'REVOKED';
+        revoked = true;
+      } else if (!rec) {
+        // SEC-04: Never sign ACTIVE for unissued, foreign, or unknown tokens
+        status = 'UNKNOWN';
+        revoked = true;
+      } else if (now >= rec.usage_expires_at_ms || now >= rec.provider_expires_at_ms) {
+        status = 'EXPIRED';
+        revoked = true;
+      } else {
+        status = 'ACTIVE';
+        revoked = false;
+      }
+
       const payload: TokenStatusPayload = {
         version: 1,
         broker_issuer: this.config.brokerIssuer,
         token_sha256: tokenSha,
-        status: revoked ? 'REVOKED' : 'ACTIVE',
+        status,
         revoked,
         nonce: params.nonce,
         issued_at: new Date(now).toISOString(),
@@ -816,22 +893,81 @@ export class TrustedDesktopBroker {
     });
   }
 
-  async revokeIssuedToken(token: string): Promise<void> {
+  async revokeIssuedToken(
+    token: string,
+    options: { localOnly?: boolean } = {},
+  ): Promise<{
+    ok: boolean;
+    token_sha256: string;
+    local_revoked: boolean;
+    provider_revoked: boolean;
+    provider_status?: number;
+  }> {
+    if (typeof token !== 'string' || !token.trim()) {
+      throw Error('BROKER_TOKEN_INVALID');
+    }
     const tokenHash = createHash('sha256').update(token, 'utf8').digest('hex');
     await this.withFileLock(async () => {
       const state = await this.readOrInitState();
       if (!state.revokedTokens.includes(tokenHash)) {
         state.revokedTokens.push(tokenHash);
       }
+      if (state.issuedTokens?.[tokenHash]) {
+        state.issuedTokens[tokenHash]!.revoked = true;
+      }
       await this.atomicWrite(state);
     });
+
+    if (options.localOnly === true) {
+      await this.withFileLock(async () => {
+        const state = await this.readOrInitState();
+        this.appendAudit(state, {
+          operation: 'REVOKE_TOKEN',
+          outcome: 'ALLOWED',
+          code: 'BROKER_TOKEN_REVOKED_LOCAL_ONLY',
+        });
+        await this.atomicWrite(state);
+      });
+      return {
+        ok: true,
+        token_sha256: tokenHash,
+        local_revoked: true,
+        provider_revoked: false,
+      };
+    }
+
+    const prov = await this.config.githubAppAdapter.revokeInstallationTokenAtProvider(token);
+    await this.withFileLock(async () => {
+      const state = await this.readOrInitState();
+      if (state.issuedTokens?.[tokenHash] && prov.revokedAtProvider) {
+        state.issuedTokens[tokenHash]!.provider_revoked = true;
+      }
+      this.appendAudit(state, {
+        operation: 'REVOKE_TOKEN',
+        outcome: 'ALLOWED',
+        code: prov.revokedAtProvider ? 'BROKER_TOKEN_REVOKED_AT_PROVIDER' : 'BROKER_TOKEN_REVOKED_LOCAL_PROVIDER_UNKNOWN',
+      });
+      await this.atomicWrite(state);
+    });
+    return {
+      ok: true,
+      token_sha256: tokenHash,
+      local_revoked: true,
+      provider_revoked: prov.revokedAtProvider,
+      provider_status: prov.status,
+    };
   }
 
   async isTokenRevoked(token: string): Promise<boolean> {
     const tokenHash = createHash('sha256').update(token, 'utf8').digest('hex');
+    const now = this.nowMs();
     return this.withFileLock(async () => {
       const state = await this.readOrInitState();
-      return state.revokedTokens.includes(tokenHash);
+      if (state.revokedTokens.includes(tokenHash)) return true;
+      const rec = state.issuedTokens?.[tokenHash];
+      if (!rec || rec.revoked) return true;
+      if (now >= rec.usage_expires_at_ms || now >= rec.provider_expires_at_ms) return true;
+      return false;
     });
   }
 

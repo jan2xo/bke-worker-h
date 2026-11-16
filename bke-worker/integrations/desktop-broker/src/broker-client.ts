@@ -101,6 +101,11 @@ export class DeviceKeyPairSigner {
     nowMs?: number;
     ttlMs?: number;
     nonce?: string;
+    ledger_op?: DeviceSignedAssertionPayload['ledger_op'];
+    pr_number?: number;
+    head_sha?: string;
+    attempt_id?: string;
+    ref_name?: string;
   }): DeviceSignedAssertion {
     const now = params.nowMs ?? Date.now();
     const payload: DeviceSignedAssertionPayload = {
@@ -112,8 +117,24 @@ export class DeviceKeyPairSigner {
       repository: params.repository,
       nonce: params.nonce ?? randomBytes(16).toString('base64url'),
       issued_at: new Date(now).toISOString(),
-      expires_at: new Date(now + (params.ttlMs ?? 60_000)).toString() ? new Date(now + (params.ttlMs ?? 60_000)).toISOString() : '',
+      expires_at: new Date(now + (params.ttlMs ?? 60_000)).toISOString(),
     };
+    if (params.purpose === 'SERVER_MEDIATED_LEDGER_OP') {
+      if (
+        !params.ledger_op ||
+        typeof params.pr_number !== 'number' ||
+        !params.head_sha ||
+        !params.attempt_id ||
+        !params.ref_name
+      ) {
+        throw Error('DEVICE_ASSERTION_LEDGER_FIELDS_MISSING');
+      }
+      payload.ledger_op = params.ledger_op;
+      payload.pr_number = params.pr_number;
+      payload.head_sha = params.head_sha;
+      payload.attempt_id = params.attempt_id;
+      payload.ref_name = params.ref_name;
+    }
     const msg = Buffer.from(
       DEVICE_POP_DOMAIN + canonicalJson(payload as unknown as Record<string, unknown>),
       'utf8',
@@ -446,6 +467,8 @@ export class SandboxHttpTokenBrokerClient {
     permissions: Record<string, string>;
     issuedAtMs: number;
     expiresAtMs: number;
+    usageExpiresAtMs?: number;
+    providerExpiresAtMs?: number;
   }> {
     if (this.config.workerId !== undefined && request.workerId !== this.config.workerId) {
       throw Error('TOKEN_WORKER_MISMATCH');
@@ -594,12 +617,16 @@ export class SandboxHttpTokenBrokerClient {
       permissions: cleanPerms,
       issuedAtMs: rawTok.issuedAtMs,
       expiresAtMs: rawTok.expiresAtMs,
+      ...(typeof rawTok.usageExpiresAtMs === 'number' ? { usageExpiresAtMs: rawTok.usageExpiresAtMs } : {}),
+      ...(typeof rawTok.providerExpiresAtMs === 'number'
+        ? { providerExpiresAtMs: rawTok.providerExpiresAtMs }
+        : {}),
     };
   }
 
   async checkTokenStatus(
     token: string,
-  ): Promise<{ status: DeviceRevocationStatus; code?: string }> {
+  ): Promise<{ status: DeviceRevocationStatus | 'EXPIRED'; code?: string }> {
     if (typeof token !== 'string' || !token.trim()) {
       return { status: 'UNKNOWN', code: 'TOKEN_REVOCATION_UNAVAILABLE' };
     }
@@ -633,6 +660,12 @@ export class SandboxHttpTokenBrokerClient {
 
     if (p.status === 'REVOKED' && p.revoked === true) {
       return { status: 'REVOKED', code: 'TOKEN_REVOKED' };
+    }
+    if (p.status === 'EXPIRED' && p.revoked === true) {
+      return { status: 'EXPIRED', code: 'TOKEN_EXPIRED' };
+    }
+    if (p.status === 'UNKNOWN' && p.revoked === true) {
+      return { status: 'UNKNOWN', code: 'TOKEN_UNKNOWN_OR_UNISSUED' };
     }
     if (p.status === 'ACTIVE' && p.revoked === false) {
       return { status: 'ACTIVE' };
@@ -686,6 +719,11 @@ export class SandboxHttpTokenBrokerClient {
       enrollment_generation: this.config.enrollmentGeneration,
       purpose: 'SERVER_MEDIATED_LEDGER_OP',
       repository: input.repository,
+      ledger_op: input.operation,
+      pr_number: input.prNumber,
+      head_sha: input.headSha,
+      attempt_id: input.attemptId,
+      ref_name: input.refName,
       nowMs: (this.config.nowMs ?? Date.now)(),
     });
     const res = await this.postJsonWithTimeout('/v1/broker/ledger-ops', {

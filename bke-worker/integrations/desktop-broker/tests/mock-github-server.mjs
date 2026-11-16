@@ -22,7 +22,13 @@ export async function startMockGitHubServer(initialConfig = {}) {
     forceStatus: null, // e.g. { pathIncludes: '/pulls', status: 503 }
     dropAfterMutateCount: 0, // Accept POST /git/refs or /git/commits then destroy socket!
     incompleteRepoPagination: false,
+    incompletePullsPagination: false,
+    malformedPullsLink: false,
     incompleteCheckPagination: false,
+    missingCheckTotalCount: false,
+    pullsPageSize: 100,
+    checkRunsPageSize: 100,
+    refsPageSize: 100,
     lyingReadBackSha: null,
     repos: initialConfig.repos ?? [
       {
@@ -45,6 +51,7 @@ export async function startMockGitHubServer(initialConfig = {}) {
     refs: new Map(),
     checkRunsByHead: new Map(),
     issuedTokens: new Map(),
+    revokedInstallationTokens: new Set(),
     requestLog: [],
     commitSeq: 1,
     delayMs: 0,
@@ -73,8 +80,39 @@ export async function startMockGitHubServer(initialConfig = {}) {
 
     const send = (status, data, headers = {}) => {
       if (res.writableEnded || res.destroyed) return;
+      if (status === 204) {
+        res.writeHead(204, headers);
+        res.end();
+        return;
+      }
       res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
       res.end(typeof data === 'string' ? data : JSON.stringify(data));
+    };
+
+    const getBearer = () => {
+      const authHeader = req.headers.authorization ?? '';
+      return authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
+    };
+
+    const validateInstallationBearer = (repoId = null) => {
+      const bearerTok = getBearer();
+      if (!bearerTok) return { ok: true, issued: undefined };
+      if (state.revokedInstallationTokens.has(bearerTok)) {
+        return { ok: false, status: 401, message: 'Bad credentials' };
+      }
+      const issued = state.issuedTokens.get(bearerTok);
+      if (!issued && bearerTok.startsWith('ghs_sandbox_')) {
+        return { ok: false, status: 401, message: 'Bad credentials' };
+      }
+      if (
+        issued &&
+        repoId !== null &&
+        issued.repositoryIds !== null &&
+        !issued.repositoryIds.includes(repoId)
+      ) {
+        return { ok: false, status: 403, message: 'Resource not accessible by integration' };
+      }
+      return { ok: true, issued };
     };
 
     if (state.redirectOnNextCall) {
@@ -115,9 +153,10 @@ export async function startMockGitHubServer(initialConfig = {}) {
       if (state.installationRevoked) return send(403, { message: 'Installation suspended' });
       const tok = `ghs_sandbox_${randomBytes(10).toString('hex')}`;
       const requestedPerms = body?.permissions ?? {};
-      // Mirror GitHub returning current server perms (allows simulating escalation/downgrade if mutated in state)
+      // Preserve null when repository_ids is omitted (installation-wide token) vs explicit ID list
+      const requestedRepoIds = Array.isArray(body?.repository_ids) ? body.repository_ids : null;
       const granted = { ...requestedPerms };
-      state.issuedTokens.set(tok, { permissions: granted, repositoryIds: body?.repository_ids ?? [] });
+      state.issuedTokens.set(tok, { permissions: granted, repositoryIds: requestedRepoIds });
       return send(201, {
         token: tok,
         expires_at: new Date(Date.now() + 600_000).toISOString(),
@@ -125,12 +164,26 @@ export async function startMockGitHubServer(initialConfig = {}) {
       });
     }
 
+    // 2b. Revoke installation token at provider: DELETE /installation/token
+    if (req.method === 'DELETE' && p === '/installation/token') {
+      const bearerTok = getBearer();
+      if (!bearerTok || state.revokedInstallationTokens.has(bearerTok) || !state.issuedTokens.has(bearerTok)) {
+        return send(401, { message: 'Bad credentials' });
+      }
+      state.revokedInstallationTokens.add(bearerTok);
+      return send(204, null);
+    }
+
     // 3. Installation repositories: GET /installation/repositories
     if (req.method === 'GET' && p === '/installation/repositories') {
-      const authHeader = req.headers.authorization ?? '';
-      const bearerTok = authHeader.startsWith('Bearer ') ? authHeader.slice('Bearer '.length).trim() : '';
-      const issued = bearerTok ? state.issuedTokens.get(bearerTok) : undefined;
-      const reposWithTokPerms = state.repos.map((repo) => {
+      const auth = validateInstallationBearer(null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
+      const issued = auth.issued;
+      const visibleRepos =
+        issued && issued.repositoryIds !== null
+          ? state.repos.filter((repo) => issued.repositoryIds.includes(repo.id))
+          : state.repos;
+      const reposWithTokPerms = visibleRepos.map((repo) => {
         if (!issued) return repo;
         const pms = {
           ...issued.permissions,
@@ -162,15 +215,27 @@ export async function startMockGitHubServer(initialConfig = {}) {
       const repoName = pullsListMatch[1];
       const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
       if (!repo) return send(404, { message: 'Repo not found' });
-      return send(
-        200,
-        repo.prs.map((pr) => ({
-          number: pr.number,
-          state: pr.state,
-          head: { sha: pr.headSha },
-          labels: pr.labels.map((name) => ({ name })),
-        })),
-      );
+      const auth = validateInstallationBearer(repo.id);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
+      const allPrs = repo.prs.map((pr) => ({
+        number: pr.number,
+        state: pr.state,
+        head: { sha: pr.headSha },
+        labels: pr.labels.map((name) => ({ name })),
+      }));
+      const page = Math.max(1, Number(u.searchParams.get('page') ?? '1'));
+      const pageSize = Math.max(1, state.pullsPageSize);
+      const start = (page - 1) * pageSize;
+      const slice = allPrs.slice(start, start + pageSize);
+      const headers = {};
+      if (state.malformedPullsLink) {
+        headers.Link = `bad-link-without-brackets; rel="next"`;
+      } else if (state.incompletePullsPagination) {
+        headers.Link = `<${baseUrl}/repos/${repoName}/pulls?state=open&per_page=${pageSize}&page=${page + 1}>; rel="next"`;
+      } else if (start + pageSize < allPrs.length) {
+        headers.Link = `<${baseUrl}/repos/${repoName}/pulls?state=open&per_page=${pageSize}&page=${page + 1}>; rel="next"`;
+      }
+      return send(200, slice, headers);
     }
 
     // 5. Single PR detail: GET /repos/:owner/:repo/pulls/:num
@@ -179,7 +244,10 @@ export async function startMockGitHubServer(initialConfig = {}) {
       const repoName = prDetailMatch[1];
       const prNum = Number(prDetailMatch[2]);
       const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
-      const pr = repo?.prs.find((x) => x.number === prNum);
+      if (!repo) return send(404, { message: 'PR not found' });
+      const auth = validateInstallationBearer(repo.id);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
+      const pr = repo.prs.find((x) => x.number === prNum);
       if (!pr) return send(404, { message: 'PR not found' });
       return send(200, {
         number: pr.number,
@@ -193,30 +261,58 @@ export async function startMockGitHubServer(initialConfig = {}) {
     const crMatch = /^\/repos\/([^/]+\/[^/]+)\/commits\/([a-f0-9]{40})\/check-runs$/.exec(p);
     if (req.method === 'GET' && crMatch) {
       const repoName = crMatch[1];
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const sha = crMatch[2];
       const runs = state.checkRunsByHead.get(`${repoName}:${sha}`) ?? [];
+      if (state.missingCheckTotalCount) {
+        return send(200, { check_runs: runs });
+      }
       if (state.incompleteCheckPagination) {
         return send(200, { total_count: runs.length + 5, check_runs: runs });
       }
-      return send(200, { total_count: runs.length, check_runs: runs });
+      const page = Math.max(1, Number(u.searchParams.get('page') ?? '1'));
+      const pageSize = Math.max(1, state.checkRunsPageSize);
+      const start = (page - 1) * pageSize;
+      const slice = runs.slice(start, start + pageSize);
+      const headers = {};
+      if (start + pageSize < runs.length) {
+        headers.Link = `<${baseUrl}/repos/${repoName}/commits/${sha}/check-runs?per_page=${pageSize}&page=${page + 1}>; rel="next"`;
+      }
+      return send(200, { total_count: runs.length, check_runs: slice }, headers);
     }
 
     // 7. Matching BKE refs: GET /repos/:owner/:repo/git/matching-refs/bke/
     const matchRef = /^\/repos\/([^/]+\/[^/]+)\/git\/matching-refs\/bke\/?$/.exec(p);
     if (req.method === 'GET' && matchRef) {
       const repoName = matchRef[1];
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const out = [];
       for (const [k, sha] of state.refs.entries()) {
         if (k.startsWith(`${repoName}:refs/bke/`)) {
           out.push({ ref: k.slice(repoName.length + 1), object: { sha } });
         }
       }
-      return send(200, out);
+      const page = Math.max(1, Number(u.searchParams.get('page') ?? '1'));
+      const pageSize = Math.max(1, state.refsPageSize);
+      const start = (page - 1) * pageSize;
+      const slice = out.slice(start, start + pageSize);
+      const headers = {};
+      if (start + pageSize < out.length) {
+        headers.Link = `<${baseUrl}/repos/${repoName}/git/matching-refs/bke/?per_page=${pageSize}&page=${page + 1}>; rel="next"`;
+      }
+      return send(200, slice, headers);
     }
 
     // 8. Get commit: GET /repos/:owner/:repo/git/commits/:sha
     const getCommitMatch = /^\/repos\/([^/]+\/[^/]+)\/git\/commits\/([a-f0-9]{40})$/.exec(p);
     if (req.method === 'GET' && getCommitMatch) {
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === getCommitMatch[1].toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const key = `${getCommitMatch[1]}:${getCommitMatch[2]}`;
       const c = state.commits.get(key);
       return c ? send(200, c) : send(404, { message: 'Commit not found' });
@@ -226,6 +322,9 @@ export async function startMockGitHubServer(initialConfig = {}) {
     const postCommitMatch = /^\/repos\/([^/]+\/[^/]+)\/git\/commits$/.exec(p);
     if (req.method === 'POST' && postCommitMatch) {
       const repoName = postCommitMatch[1];
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const sha = ('c' + String(state.commitSeq++)).padEnd(40, '0').slice(0, 40);
       const created = {
         sha,
@@ -241,6 +340,9 @@ export async function startMockGitHubServer(initialConfig = {}) {
     const getRefMatch = /^\/repos\/([^/]+\/[^/]+)\/git\/ref\/(.+)$/.exec(p);
     if (req.method === 'GET' && getRefMatch) {
       const repoName = getRefMatch[1];
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const refName = `refs/${getRefMatch[2]}`;
       const key = `${repoName}:${refName}`;
       if (!state.refs.has(key)) return send(404, { message: 'Ref not found' });
@@ -252,6 +354,9 @@ export async function startMockGitHubServer(initialConfig = {}) {
     const postRefMatch = /^\/repos\/([^/]+\/[^/]+)\/git\/refs$/.exec(p);
     if (req.method === 'POST' && postRefMatch) {
       const repoName = postRefMatch[1];
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const key = `${repoName}:${body.ref}`;
       if (state.refs.has(key)) {
         return send(422, { message: 'Reference already exists' });
@@ -269,6 +374,9 @@ export async function startMockGitHubServer(initialConfig = {}) {
     const patchRefMatch = /^\/repos\/([^/]+\/[^/]+)\/git\/refs\/(.+)$/.exec(p);
     if (req.method === 'PATCH' && patchRefMatch) {
       const repoName = patchRefMatch[1];
+      const repo = state.repos.find((r) => r.full_name.toLowerCase() === repoName.toLowerCase());
+      const auth = validateInstallationBearer(repo ? repo.id : null);
+      if (!auth.ok) return send(auth.status, { message: auth.message });
       const refName = `refs/${patchRefMatch[2]}`;
       const key = `${repoName}:${refName}`;
       if (!state.refs.has(key)) {
@@ -300,6 +408,10 @@ export async function startMockGitHubServer(initialConfig = {}) {
           external_id: `bke-ticket:v1:${workerId}:${attemptId}:${Math.floor(expMs / 1000)}`,
         },
       ]);
+    },
+    setCheckRuns(repo, headSha, runs) {
+      state.commits.set(`${repo}:${headSha}`, { sha: headSha, tree: { sha: TREE_A }, parents: [], message: 'head' });
+      state.checkRunsByHead.set(`${repo}:${headSha}`, runs);
     },
     close: () => {
       server.closeAllConnections?.();

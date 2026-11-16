@@ -909,6 +909,17 @@ test('F4.2-03: HttpTrustedBrokerClient rejects all 22+ broker-signed malformed/m
       await assert.rejects(() => client.isRevoked('ghs_valid_tok_123'), /TOKEN_REVOCATION_UNAVAILABLE/);
     }
 
+    // SEC-04: legitimately signed EXPIRED (revoked: true) and UNKNOWN (revoked: true)
+    tokenStatusMutator = (p) => ({ ...p, status: 'EXPIRED', revoked: true });
+    const expRes = await client.checkTokenStatus('ghs_valid_tok_123');
+    assert.deepEqual(expRes, { status: 'EXPIRED', code: 'TOKEN_EXPIRED' });
+    await assert.rejects(() => client.isRevoked('ghs_valid_tok_123'), /TOKEN_EXPIRED/);
+
+    tokenStatusMutator = (p) => ({ ...p, status: 'UNKNOWN', revoked: true });
+    const unkRes = await client.checkTokenStatus('ghs_valid_tok_123');
+    assert.deepEqual(unkRes, { status: 'UNKNOWN', code: 'TOKEN_UNKNOWN_OR_UNISSUED' });
+    await assert.rejects(() => client.isRevoked('ghs_valid_tok_123'), /TOKEN_UNKNOWN_OR_UNISSUED/);
+
     // issueToken strict scope + response validation
     const ac = new AbortController();
     await assert.rejects(

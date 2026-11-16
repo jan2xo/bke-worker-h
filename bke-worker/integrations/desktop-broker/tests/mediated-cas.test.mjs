@@ -388,6 +388,11 @@ test('F4 P0-03: All 4 Server-Mediated GitHub CAS operations succeed without desk
           purpose: 'SERVER_MEDIATED_LEDGER_OP',
           repository: REPO,
           nowMs: now,
+          ledger_op: 'COMMIT_PRE_SEND_FENCE',
+          pr_number: PR_NUM,
+          head_sha: HEAD_A,
+          attempt_id: 'att-force-1',
+          ref_name: `refs/bke/fences/${PR_NUM}/att-force-1`,
         }),
         ledger_op: {
           operation: 'COMMIT_PRE_SEND_FENCE',
@@ -407,7 +412,30 @@ test('F4 P0-03: All 4 Server-Mediated GitHub CAS operations succeed without desk
     assert.equal(forceRes.status, 409);
     assert.equal((await forceRes.json()).code, 'BROKER_ARBITRARY_PROXY_FORBIDDEN');
 
-    // MARK_DELIVERY_UNCERTAIN: COMMITTED then idempotent ALREADY_EXISTS
+    // MARK_DELIVERY_UNCERTAIN: requires prior durable PRE_SEND_FENCE owned by worker, then COMMITTED -> idempotent ALREADY_EXISTS
+    const uncFence = await brokerClient.executeLedgerOp({
+      operation: 'COMMIT_PRE_SEND_FENCE',
+      repository: REPO,
+      repositoryId: REPO_ID,
+      installationId: INSTALL_ID,
+      workerId: WORKER,
+      prNumber: PR_NUM,
+      headSha: HEAD_A,
+      attemptId: 'att-cas-unc-1',
+      refName: `refs/bke/fences/${PR_NUM}/att-cas-unc-1`,
+      commitMessage: JSON.stringify({
+        bkeEvent: 'PRE_SEND_FENCE',
+        version: 1,
+        fenceId: 'fence-unc-1',
+        attemptId: 'att-cas-unc-1',
+        workerId: WORKER,
+        headSha: HEAD_A,
+      }),
+      treeSha: TREE_A,
+    });
+    assert.equal(uncFence.ok, true);
+    assert.equal(uncFence.status, 'COMMITTED');
+
     const unc1 = await brokerClient.executeLedgerOp({
       operation: 'MARK_DELIVERY_UNCERTAIN',
       repository: REPO,

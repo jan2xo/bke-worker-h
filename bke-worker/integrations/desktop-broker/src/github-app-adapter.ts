@@ -99,7 +99,7 @@ export class SandboxGitHubAppAdapter {
   }
 
   private async httpJson(
-    method: 'GET' | 'POST' | 'PATCH',
+    method: 'GET' | 'POST' | 'PATCH' | 'DELETE',
     fullUrl: string,
     bearer: string,
     body?: unknown,
@@ -136,6 +136,9 @@ export class SandboxGitHubAppAdapter {
       if (response.status >= 300 && response.status < 400) {
         throw Error('BROKER_GITHUB_REDIRECT_BLOCKED');
       }
+      if (response.status === 204) {
+        return { status: 204, data: null, headers: response.headers };
+      }
       const data = await response.json().catch(() => {
         throw Error('BROKER_GITHUB_MALFORMED_JSON');
       });
@@ -156,7 +159,12 @@ export class SandboxGitHubAppAdapter {
       if (/;\s*rel=["']?next["']?/i.test(part)) {
         const m = /<([^>]+)>/.exec(part);
         if (!m || !m[1]) throw Error('BROKER_GITHUB_PAGINATION_MALFORMED');
-        const parsed = new URL(m[1]);
+        let parsed: URL;
+        try {
+          parsed = new URL(m[1]);
+        } catch {
+          throw Error('BROKER_GITHUB_PAGINATION_MALFORMED');
+        }
         if (parsed.origin !== this.baseOrigin) {
           throw Error('BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN');
         }
@@ -282,6 +290,71 @@ export class SandboxGitHubAppAdapter {
     };
   }
 
+  /**
+   * Internal-only installation-wide read-only token (without `repository_ids`)
+   * used strictly by broker cross-repository exclusivity checks and never returned outside.
+   */
+  private async mintInstallationWideReadAuthorityToken(expectedInstallationId: string): Promise<string> {
+    if (!INSTALL_RE.test(expectedInstallationId)) {
+      throw Error('BROKER_INSTALLATION_QUERY_INVALID');
+    }
+    const appJwt = this.createSandboxAppJwt();
+    const readPermissions: Record<string, 'read'> = {
+      contents: 'read',
+      pull_requests: 'read',
+      checks: 'read',
+    };
+    const mintRes = await this.httpJson(
+      'POST',
+      `${this.apiBaseUrl}/app/installations/${expectedInstallationId}/access_tokens`,
+      appJwt,
+      {
+        permissions: readPermissions,
+      },
+    );
+    if (mintRes.status === 403 || mintRes.status === 422 || mintRes.status === 404) {
+      throw Error('BROKER_TOKEN_MINT_DENIED_BY_GITHUB');
+    }
+    if (mintRes.status < 200 || mintRes.status >= 300) {
+      throw Error(`BROKER_TOKEN_MINT_FAILED_${mintRes.status}`);
+    }
+    const minted = mintRes.data as Record<string, unknown>;
+    const token = typeof minted.token === 'string' ? minted.token : '';
+    const expiresAtMs = typeof minted.expires_at === 'string' ? Date.parse(minted.expires_at) : NaN;
+    if (!token.startsWith('ghs_') || !Number.isFinite(expiresAtMs) || expiresAtMs <= this.nowMs() + 5_000) {
+      throw Error('BROKER_GITHUB_TOKEN_INVALID');
+    }
+    const grantedPerms = minted.permissions as Record<string, string> | undefined;
+    if (!grantedPerms || typeof grantedPerms !== 'object' || Array.isArray(grantedPerms)) {
+      throw Error('BROKER_GITHUB_GRANT_MISSING');
+    }
+    if (grantedPerms.admin || grantedPerms.maintain || grantedPerms.administration) {
+      throw Error('BROKER_PERMISSION_ESCALATION_DETECTED');
+    }
+    for (const [k, v] of Object.entries(grantedPerms)) {
+      if (!readPermissions[k] || v !== 'read') {
+        throw Error('BROKER_PERMISSION_ESCALATION_DETECTED');
+      }
+    }
+    return token;
+  }
+
+  async revokeInstallationTokenAtProvider(
+    token: string,
+  ): Promise<{ revokedAtProvider: boolean; status: number }> {
+    if (typeof token !== 'string' || !token.startsWith('ghs_')) {
+      throw Error('BROKER_TOKEN_INVALID');
+    }
+    const res = await this.httpJson('DELETE', `${this.apiBaseUrl}/installation/token`, token);
+    if (res.status === 204) {
+      return { revokedAtProvider: true, status: 204 };
+    }
+    if (res.status === 401 || res.status === 404) {
+      return { revokedAtProvider: false, status: res.status };
+    }
+    throw Error(`BROKER_TOKEN_PROVIDER_REVOKE_FAILED_${res.status}`);
+  }
+
   async listAllInstallationRepositories(
     token: string,
   ): Promise<Array<{ id: number; full_name: string; permissions: Record<string, unknown> }>> {
@@ -326,6 +399,131 @@ export class SandboxGitHubAppAdapter {
     return out;
   }
 
+  private async listAllOpenPullsForRepo(
+    token: string,
+    repository: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    let nextUrl: string | null = `${this.apiBaseUrl}/repos/${repository}/pulls?state=open&per_page=100`;
+    let pages = 0;
+    const out: Array<Record<string, unknown>> = [];
+    const seenPrNumbers = new Set<number>();
+
+    while (nextUrl) {
+      pages += 1;
+      if (pages > this.maxPages) throw Error('BROKER_PAGINATION_INCOMPLETE');
+      const res = await this.httpJson('GET', nextUrl, token);
+      if (res.status !== 200 || !Array.isArray(res.data)) {
+        throw Error('BROKER_PULLS_READ_FAILED');
+      }
+      for (const raw of res.data) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw Error('BROKER_PULLS_READ_FAILED');
+        }
+        const pr = raw as Record<string, unknown>;
+        if (typeof pr.number !== 'number' || !Number.isSafeInteger(pr.number) || pr.number < 1) {
+          throw Error('BROKER_PULLS_READ_FAILED');
+        }
+        if (seenPrNumbers.has(pr.number)) {
+          throw Error('BROKER_PAGINATION_INCOMPLETE');
+        }
+        seenPrNumbers.add(pr.number);
+        out.push(pr);
+      }
+      nextUrl = this.parseNextUrl(res.headers);
+    }
+    return out;
+  }
+
+  private async listAllCheckRunsForCommit(
+    token: string,
+    repository: string,
+    headSha: string,
+  ): Promise<Array<Record<string, unknown>>> {
+    let nextUrl: string | null = `${this.apiBaseUrl}/repos/${repository}/commits/${headSha}/check-runs?per_page=100`;
+    let pages = 0;
+    let totalCount: number | null = null;
+    const out: Array<Record<string, unknown>> = [];
+    const seenRunIds = new Set<number>();
+
+    while (nextUrl) {
+      pages += 1;
+      if (pages > this.maxPages) throw Error('BROKER_PAGINATION_INCOMPLETE');
+      const res = await this.httpJson('GET', nextUrl, token);
+      if (res.status !== 200) throw Error('BROKER_CHECK_RUNS_READ_FAILED');
+      const crBody = res.data as Record<string, unknown>;
+      if (
+        !crBody ||
+        typeof crBody !== 'object' ||
+        Array.isArray(crBody) ||
+        !Array.isArray(crBody.check_runs)
+      ) {
+        throw Error('BROKER_CHECK_RUNS_READ_FAILED');
+      }
+      if (
+        typeof crBody.total_count !== 'number' ||
+        !Number.isSafeInteger(crBody.total_count) ||
+        crBody.total_count < 0
+      ) {
+        throw Error('BROKER_PAGINATION_INCOMPLETE');
+      }
+      if (totalCount !== null && crBody.total_count !== totalCount) {
+        throw Error('BROKER_PAGINATION_INCOMPLETE');
+      }
+      totalCount = crBody.total_count;
+
+      for (const raw of crBody.check_runs) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw Error('BROKER_CHECK_RUNS_READ_FAILED');
+        }
+        const run = raw as Record<string, unknown>;
+        if (typeof run.id === 'number') {
+          if (!Number.isSafeInteger(run.id) || seenRunIds.has(run.id)) {
+            throw Error('BROKER_PAGINATION_INCOMPLETE');
+          }
+          seenRunIds.add(run.id);
+        }
+        out.push(run);
+      }
+      nextUrl = this.parseNextUrl(res.headers);
+    }
+
+    if (totalCount === null || out.length !== totalCount) {
+      throw Error('BROKER_PAGINATION_INCOMPLETE');
+    }
+    return out;
+  }
+
+  private async listMatchingBkeRefs(token: string, repository: string): Promise<string[]> {
+    let nextUrl: string | null = `${this.apiBaseUrl}/repos/${repository}/git/matching-refs/bke/?per_page=100`;
+    let pages = 0;
+    const out: string[] = [];
+    const seenRefs = new Set<string>();
+
+    while (nextUrl) {
+      pages += 1;
+      if (pages > this.maxPages) throw Error('BROKER_PAGINATION_INCOMPLETE');
+      const res = await this.httpJson('GET', nextUrl, token);
+      if (res.status !== 200 || !Array.isArray(res.data)) {
+        throw Error('BROKER_REFS_READ_FAILED');
+      }
+      for (const raw of res.data) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw Error('BROKER_REFS_READ_FAILED');
+        }
+        const refName = (raw as Record<string, unknown>).ref;
+        if (typeof refName !== 'string' || !refName.startsWith('refs/bke/')) {
+          throw Error('BROKER_REFS_READ_FAILED');
+        }
+        if (!seenRefs.has(refName)) {
+          seenRefs.add(refName);
+          out.push(refName);
+        }
+      }
+      nextUrl = this.parseNextUrl(res.headers);
+    }
+    return out;
+  }
+
   async verifyExecutionAuthority(params: {
     repository: string;
     expectedRepositoryId: number;
@@ -354,37 +552,35 @@ export class SandboxGitHubAppAdapter {
     });
 
     // Cross-repository worker assignment exclusivity across ALL installation repos
-    const allRepos = await this.listAllInstallationRepositories(minted.token);
+    // using an internal installation-wide read-only token (never exposed outside broker).
+    const instReadToken = await this.mintInstallationWideReadAuthorityToken(minted.installationId);
+    const allRepos = await this.listAllInstallationRepositories(instReadToken);
+    if (
+      !allRepos.some(
+        (r) => r.id === params.expectedRepositoryId && r.full_name.toLowerCase() === params.repository.toLowerCase(),
+      )
+    ) {
+      throw Error('BROKER_REPOSITORY_NOT_AUTHORIZED');
+    }
     const matchingWorkerPrs: Array<{ repository: string; number: number; headSha: string }> = [];
 
     for (const repo of allRepos) {
-      let nextUrl: string | null = `${this.apiBaseUrl}/repos/${repo.full_name}/pulls?state=open&per_page=100`;
-      let pages = 0;
-      while (nextUrl) {
-        pages += 1;
-        if (pages > this.maxPages) throw Error('BROKER_PAGINATION_INCOMPLETE');
-        const res = await this.httpJson('GET', nextUrl, minted.token);
-        if (res.status !== 200 || !Array.isArray(res.data)) {
-          throw Error('BROKER_PULLS_READ_FAILED');
+      const openPrs = await this.listAllOpenPullsForRepo(instReadToken, repo.full_name);
+      for (const pr of openPrs) {
+        const labels = Array.isArray(pr.labels) ? pr.labels : [];
+        const wLabels = labels
+          .map((l) => String((l as Record<string, unknown>)?.name ?? ''))
+          .filter((n) => n.startsWith('bke-worker:'))
+          .map((n) => n.slice('bke-worker:'.length));
+        if (wLabels.includes(params.workerId)) {
+          if (wLabels.length !== 1) throw Error('BROKER_MULTI_WORKER_LABEL_CONFLICT');
+          const head = (pr.head as Record<string, unknown> | undefined)?.sha;
+          matchingWorkerPrs.push({
+            repository: repo.full_name,
+            number: Number(pr.number),
+            headSha: String(head ?? ''),
+          });
         }
-        for (const prRaw of res.data) {
-          const pr = prRaw as Record<string, unknown>;
-          const labels = Array.isArray(pr.labels) ? pr.labels : [];
-          const wLabels = labels
-            .map((l) => String((l as Record<string, unknown>)?.name ?? ''))
-            .filter((n) => n.startsWith('bke-worker:'))
-            .map((n) => n.slice('bke-worker:'.length));
-          if (wLabels.includes(params.workerId)) {
-            if (wLabels.length !== 1) throw Error('BROKER_MULTI_WORKER_LABEL_CONFLICT');
-            const head = (pr.head as Record<string, unknown> | undefined)?.sha;
-            matchingWorkerPrs.push({
-              repository: repo.full_name,
-              number: Number(pr.number),
-              headSha: String(head ?? ''),
-            });
-          }
-        }
-        nextUrl = this.parseNextUrl(res.headers);
       }
     }
 
@@ -417,23 +613,15 @@ export class SandboxGitHubAppAdapter {
     const liveHead = String((prObj.head as Record<string, unknown> | undefined)?.sha ?? '');
     if (liveHead !== params.headSha) throw Error('BROKER_HEAD_SHA_STALE');
 
-    // Inspect refs/bke/* state
-    const refsRes = await this.httpJson(
-      'GET',
-      `${this.apiBaseUrl}/repos/${params.repository}/git/matching-refs/bke/?per_page=100`,
-      minted.token,
-    );
-    if (refsRes.status !== 200 || !Array.isArray(refsRes.data)) {
-      throw Error('BROKER_REFS_READ_FAILED');
-    }
+    // Inspect all paginated refs/bke/* state
+    const refNames = await this.listMatchingBkeRefs(minted.token, params.repository);
     const consumedAttempts = new Set<string>();
     const uncertainPrefix = `refs/bke/uncertain/${params.prNumber}/`;
     const claimPrefix = `refs/bke/claims/${params.prNumber}/`;
     const convRef = `refs/bke/conversations/${params.prNumber}`;
     let conversationExists = false;
 
-    for (const r of refsRes.data) {
-      const refName = String((r as Record<string, unknown>)?.ref ?? '');
+    for (const refName of refNames) {
       if (refName.startsWith(uncertainPrefix)) {
         throw Error('BROKER_DELIVERY_UNCERTAIN_QUARANTINED');
       }
@@ -451,22 +639,11 @@ export class SandboxGitHubAppAdapter {
       }
     }
 
-    // Verify pinned check run ticket if non-HALT
+    // Verify pinned check run ticket across all paginated check-runs if non-HALT
     let ticketCheckRunId = 0;
     if (params.requiredAction !== 'HALT') {
-      const crRes = await this.httpJson(
-        'GET',
-        `${this.apiBaseUrl}/repos/${params.repository}/commits/${params.headSha}/check-runs?per_page=100`,
-        minted.token,
-      );
-      if (crRes.status !== 200) throw Error('BROKER_CHECK_RUNS_READ_FAILED');
-      const crBody = crRes.data as Record<string, unknown>;
-      const runs = Array.isArray(crBody.check_runs) ? crBody.check_runs : [];
-      if (typeof crBody.total_count === 'number' && runs.length !== crBody.total_count) {
-        throw Error('BROKER_PAGINATION_INCOMPLETE');
-      }
-      const validRuns = runs.filter((raw) => {
-        const c = raw as Record<string, unknown>;
+      const runs = await this.listAllCheckRunsForCommit(minted.token, params.repository, params.headSha);
+      const validRuns = runs.filter((c) => {
         const app = c.app as Record<string, unknown> | undefined;
         const ext = typeof c.external_id === 'string' ? c.external_id : '';
         return (
@@ -480,11 +657,11 @@ export class SandboxGitHubAppAdapter {
         );
       });
       if (validRuns.length !== 1) throw Error('BROKER_TICKET_INVALID_OR_AMBIGUOUS');
-      const expEpoch = Number(String((validRuns[0] as Record<string, unknown>).external_id).split(':')[4]);
+      const expEpoch = Number(String(validRuns[0]!.external_id).split(':')[4]);
       if (!Number.isFinite(expEpoch) || expEpoch * 1000 <= this.nowMs()) {
         throw Error('BROKER_TICKET_EXPIRED');
       }
-      ticketCheckRunId = Number((validRuns[0] as Record<string, unknown>).id);
+      ticketCheckRunId = Number(validRuns[0]!.id);
     }
 
     return {
@@ -532,45 +709,95 @@ export class SandboxGitHubAppAdapter {
         return { ok: false, code: 'BROKER_LEDGER_WORKER_CONFLICT' };
       }
 
-      // Confirm worker is not simultaneously assigned to multiple open PRs in this repo
-      const listRes = await this.httpJson(
-        'GET',
-        `${this.apiBaseUrl}/repos/${req.repository}/pulls?state=open&per_page=100`,
-        token,
-      );
-      if (listRes.status !== 200 || !Array.isArray(listRes.data)) {
+      // Cross-repository worker exclusivity across ALL installation repositories & all pages
+      let allRepos;
+      let instReadToken: string;
+      try {
+        instReadToken = await this.mintInstallationWideReadAuthorityToken(req.installation_id);
+        allRepos = await this.listAllInstallationRepositories(instReadToken);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (
+          msg === 'BROKER_PAGINATION_INCOMPLETE' ||
+          msg === 'BROKER_GITHUB_PAGINATION_MALFORMED' ||
+          msg === 'BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN'
+        ) {
+          return { ok: false, code: msg };
+        }
         return { ok: false, code: 'BROKER_LEDGER_PULLS_UNAVAILABLE' };
       }
-      let assignedCount = 0;
-      for (const rawPr of listRes.data) {
-        const p = rawPr as Record<string, unknown>;
-        const owners = Array.isArray(p.labels)
-          ? p.labels
-              .map((l) => String((l as Record<string, unknown>)?.name ?? ''))
-              .filter((n) => n.startsWith('bke-worker:'))
-              .map((n) => n.slice('bke-worker:'.length))
-          : [];
-        if (owners.includes(req.worker_id)) {
-          assignedCount += 1;
+      if (
+        !allRepos.some(
+          (r) => r.id === req.repository_id && r.full_name.toLowerCase() === req.repository.toLowerCase(),
+        )
+      ) {
+        return { ok: false, code: 'BROKER_REPOSITORY_NOT_AUTHORIZED' };
+      }
+
+      const matchingPrs: Array<{ repository: string; number: number }> = [];
+      for (const repo of allRepos) {
+        let openPrs;
+        try {
+          openPrs = await this.listAllOpenPullsForRepo(instReadToken, repo.full_name);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : '';
+          if (
+            msg === 'BROKER_PAGINATION_INCOMPLETE' ||
+            msg === 'BROKER_GITHUB_PAGINATION_MALFORMED' ||
+            msg === 'BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN'
+          ) {
+            return { ok: false, code: msg };
+          }
+          return { ok: false, code: 'BROKER_LEDGER_PULLS_UNAVAILABLE' };
+        }
+        for (const p of openPrs) {
+          const owners = Array.isArray(p.labels)
+            ? p.labels
+                .map((l) => String((l as Record<string, unknown>)?.name ?? ''))
+                .filter((n) => n.startsWith('bke-worker:'))
+                .map((n) => n.slice('bke-worker:'.length))
+            : [];
+          if (owners.includes(req.worker_id)) {
+            if (owners.length !== 1) {
+              return { ok: false, code: 'BROKER_MULTI_WORKER_LABEL_CONFLICT' };
+            }
+            matchingPrs.push({ repository: repo.full_name, number: Number(p.number) });
+          }
         }
       }
-      if (assignedCount !== 1) {
+      if (matchingPrs.length > 1) {
+        const repoSet = new Set(matchingPrs.map((m) => m.repository.toLowerCase()));
+        if (repoSet.size > 1) {
+          return { ok: false, code: 'BROKER_LEDGER_CROSS_REPO_WORKER_CONFLICT' };
+        }
         return { ok: false, code: 'BROKER_LEDGER_MULTI_PR_CONFLICT' };
+      }
+      if (
+        matchingPrs.length !== 1 ||
+        matchingPrs[0]!.repository.toLowerCase() !== req.repository.toLowerCase() ||
+        matchingPrs[0]!.number !== req.pr_number
+      ) {
+        return { ok: false, code: 'BROKER_LEDGER_WORKER_CONFLICT' };
       }
     }
 
     if (!allowUncertainRefs) {
-      const refsRes = await this.httpJson(
-        'GET',
-        `${this.apiBaseUrl}/repos/${req.repository}/git/matching-refs/bke/?per_page=100`,
-        token,
-      );
-      if (refsRes.status !== 200 || !Array.isArray(refsRes.data)) {
+      let refNames: string[];
+      try {
+        refNames = await this.listMatchingBkeRefs(token, req.repository);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '';
+        if (
+          msg === 'BROKER_PAGINATION_INCOMPLETE' ||
+          msg === 'BROKER_GITHUB_PAGINATION_MALFORMED' ||
+          msg === 'BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN'
+        ) {
+          return { ok: false, code: msg };
+        }
         return { ok: false, code: 'BROKER_LEDGER_REFS_UNAVAILABLE' };
       }
       const uncertainPrefix = `refs/bke/uncertain/${req.pr_number}/`;
-      for (const rawRef of refsRes.data) {
-        const refName = String((rawRef as Record<string, unknown>)?.ref ?? '');
+      for (const refName of refNames) {
         if (refName.startsWith(uncertainPrefix)) {
           return { ok: false, code: 'BROKER_DELIVERY_UNCERTAIN_QUARANTINED' };
         }
@@ -586,18 +813,21 @@ export class SandboxGitHubAppAdapter {
     if (!req.worker_id) {
       return { ok: true };
     }
-    const crRes = await this.httpJson(
-      'GET',
-      `${this.apiBaseUrl}/repos/${req.repository}/commits/${req.head_sha}/check-runs?per_page=100`,
-      token,
-    );
-    if (crRes.status !== 200) {
+    let runs: Array<Record<string, unknown>>;
+    try {
+      runs = await this.listAllCheckRunsForCommit(token, req.repository, req.head_sha);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '';
+      if (
+        msg === 'BROKER_PAGINATION_INCOMPLETE' ||
+        msg === 'BROKER_GITHUB_PAGINATION_MALFORMED' ||
+        msg === 'BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN'
+      ) {
+        return { ok: false, code: msg };
+      }
       return { ok: false, code: 'BROKER_CHECK_RUNS_READ_FAILED' };
     }
-    const crBody = crRes.data as Record<string, unknown>;
-    const runs = Array.isArray(crBody.check_runs) ? crBody.check_runs : [];
-    const validRuns = runs.filter((raw) => {
-      const c = raw as Record<string, unknown>;
+    const validRuns = runs.filter((c) => {
       const app = c.app as Record<string, unknown> | undefined;
       const ext = typeof c.external_id === 'string' ? c.external_id : '';
       return (
@@ -613,7 +843,7 @@ export class SandboxGitHubAppAdapter {
     if (validRuns.length !== 1) {
       return { ok: false, code: 'BROKER_TICKET_INVALID_OR_AMBIGUOUS' };
     }
-    const expEpoch = Number(String((validRuns[0] as Record<string, unknown>).external_id).split(':')[4]);
+    const expEpoch = Number(String(validRuns[0]!.external_id).split(':')[4]);
     if (!Number.isFinite(expEpoch) || expEpoch * 1000 <= this.nowMs()) {
       return { ok: false, code: 'BROKER_TICKET_EXPIRED' };
     }
@@ -705,6 +935,53 @@ export class SandboxGitHubAppAdapter {
 
     try {
       if (req.operation === 'MARK_DELIVERY_UNCERTAIN') {
+        if (!req.worker_id || !WORKER_RE.test(req.worker_id)) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_WORKER_CONFLICT' };
+        }
+        // SEC-03: Prove requesting worker owns an existing durable pre-send fence commit for this PR/attempt/head
+        const fenceRefSuffix = `bke/fences/${req.pr_number}/${req.attempt_id}`;
+        const fenceRes = await this.httpJson(
+          'GET',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/ref/${fenceRefSuffix}`,
+          minted.token,
+        );
+        if (fenceRes.status !== 200) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_MISSING' };
+        }
+        const fenceObj = fenceRes.data as Record<string, unknown>;
+        const fenceCommitSha = String((fenceObj.object as Record<string, unknown> | undefined)?.sha ?? '');
+        if (fenceObj.ref !== `refs/${fenceRefSuffix}` || !SHA40_RE.test(fenceCommitSha)) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_INVALID' };
+        }
+        const fenceCommitRes = await this.httpJson(
+          'GET',
+          `${this.apiBaseUrl}/repos/${req.repository}/git/commits/${fenceCommitSha}`,
+          minted.token,
+        );
+        if (fenceCommitRes.status !== 200) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_INVALID' };
+        }
+        let fenceMeta: unknown;
+        try {
+          fenceMeta = JSON.parse(
+            String((fenceCommitRes.data as Record<string, unknown> | undefined)?.message ?? ''),
+          );
+        } catch {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_INVALID' };
+        }
+        if (!fenceMeta || typeof fenceMeta !== 'object' || Array.isArray(fenceMeta)) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_INVALID' };
+        }
+        const fm = fenceMeta as Record<string, unknown>;
+        if (
+          fm.bkeEvent !== 'PRE_SEND_FENCE' ||
+          fm.workerId !== req.worker_id ||
+          fm.attemptId !== req.attempt_id ||
+          fm.headSha !== req.head_sha
+        ) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_UNCERTAIN_OWNERSHIP_CONFLICT' };
+        }
+
         const postRef = await this.httpJson(
           'POST',
           `${this.apiBaseUrl}/repos/${req.repository}/git/refs`,
@@ -736,6 +1013,26 @@ export class SandboxGitHubAppAdapter {
       }
 
       if (req.operation === 'COMMIT_PRE_SEND_FENCE') {
+        try {
+          const parsedFence = JSON.parse(req.commit_message) as unknown;
+          if (
+            parsedFence &&
+            typeof parsedFence === 'object' &&
+            !Array.isArray(parsedFence) &&
+            (parsedFence as Record<string, unknown>).bkeEvent === 'PRE_SEND_FENCE'
+          ) {
+            const pf = parsedFence as Record<string, unknown>;
+            if (
+              (req.worker_id && pf.workerId !== req.worker_id) ||
+              pf.attemptId !== req.attempt_id ||
+              pf.headSha !== req.head_sha
+            ) {
+              return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_PAYLOAD_INVALID' };
+            }
+          }
+        } catch {
+          // Non-JSON legacy test commit messages allowed here; MARK_DELIVERY_UNCERTAIN requires structured PRE_SEND_FENCE JSON.
+        }
         const prCheck = await this.verifyMediatedPrAndNoUncertain(minted.token, req);
         if (!prCheck.ok) {
           return { ok: false, status: 'CONFLICT', code: prCheck.code };

@@ -148,6 +148,11 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
             purpose: 'SERVER_MEDIATED_LEDGER_OP',
             repository: op.repository,
             nowMs: now,
+            ledger_op: op.operation,
+            pr_number: op.prNumber,
+            head_sha: op.headSha,
+            attempt_id: op.attemptId,
+            ref_name: op.refName,
           }),
           ledger_op: {
             operation: op.operation,
