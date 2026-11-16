@@ -78,6 +78,34 @@ function mkAdmin(adminKeys, action, now, extra = {}) {
   );
 }
 
+function fenceMsg(attemptId, workerId = WORKER_A, headSha = HEAD_A, fenceId = `fence-${attemptId}`) {
+  return JSON.stringify({
+    bkeEvent: 'PRE_SEND_FENCE',
+    version: 1,
+    fenceId,
+    attemptId,
+    workerId,
+    headSha,
+  });
+}
+
+function signedLedgerCall(signer, deviceId, now, ledgerOp) {
+  return {
+    worker_id: ledgerOp.worker_id,
+    device_assertion: signer.signDeviceAssertion({
+      worker_id: ledgerOp.worker_id,
+      device_id: deviceId,
+      installation_id: ledgerOp.installation_id,
+      enrollment_generation: 1,
+      purpose: 'SERVER_MEDIATED_LEDGER_OP',
+      repository: ledgerOp.repository,
+      nowMs: now,
+      ledger_op: ledgerOp,
+    }),
+    ledger_op: ledgerOp,
+  };
+}
+
 async function enrollDevice(
   registry,
   adminKeys,
@@ -224,23 +252,8 @@ test('SEC-01: Installation-wide cross-repo worker exclusivity survives single-re
     );
 
     // 3. Broker STILL catches cross-repo worker conflict during mediated CAS fence & claim
-    const fenceConflict = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec01',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec01`,
-      }),
-      ledger_op: {
+    const fenceConflict = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -250,10 +263,10 @@ test('SEC-01: Installation-wide cross-repo worker exclusivity survives single-re
         head_sha: HEAD_A,
         attempt_id: 'att-sec01',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec01`,
-        commit_message: 'bke fence',
+        commit_message: fenceMsg('att-sec01'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceConflict.ok, false);
     assert.equal(fenceConflict.code, 'BROKER_LEDGER_CROSS_REPO_WORKER_CONFLICT');
     assert.equal(mockGh.state.refs.size, 0);
@@ -261,23 +274,8 @@ test('SEC-01: Installation-wide cross-repo worker exclusivity survives single-re
     // 4. Incomplete repo enumeration fails closed
     mockGh.state.repos[1].prs[0].labels = [`bke-worker:${WORKER_B}`];
     mockGh.state.incompleteRepoPagination = true;
-    const incompleteRes = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec01-inc',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec01-inc`,
-      }),
-      ledger_op: {
+    const incompleteRes = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -287,10 +285,10 @@ test('SEC-01: Installation-wide cross-repo worker exclusivity survives single-re
         head_sha: HEAD_A,
         attempt_id: 'att-sec01-inc',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec01-inc`,
-        commit_message: 'bke fence',
+        commit_message: fenceMsg('att-sec01-inc'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(incompleteRes.ok, false);
     assert.equal(incompleteRes.code, 'BROKER_PAGINATION_INCOMPLETE');
 
@@ -418,23 +416,8 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         }),
       /BROKER_MULTI_PR_CONFLICT/,
     );
-    const fenceMpr = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02`,
-      }),
-      ledger_op: {
+    const fenceMpr = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -444,10 +427,10 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02`,
-        commit_message: 'bke fence',
+        commit_message: fenceMsg('att-sec02'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceMpr.ok, false);
     assert.equal(fenceMpr.code, 'BROKER_LEDGER_MULTI_PR_CONFLICT');
 
@@ -481,23 +464,8 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         }),
       /BROKER_DELIVERY_UNCERTAIN_QUARANTINED/,
     );
-    const fenceUnc = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02`,
-      }),
-      ledger_op: {
+    const fenceUnc = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -507,10 +475,10 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02`,
-        commit_message: 'bke fence',
+        commit_message: fenceMsg('att-sec02'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceUnc.ok, false);
     assert.equal(fenceUnc.code, 'BROKER_DELIVERY_UNCERTAIN_QUARANTINED');
 
@@ -540,23 +508,8 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
     assert.equal(okAuth.envelope.action, 'DISPATCH_FIRST_MESSAGE');
     assert.equal(okAuth.envelope.pr_number, PR_NUM);
 
-    const fenceSec02 = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02`,
-      }),
-      ledger_op: {
+    const fenceSec02 = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -566,29 +519,14 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02`,
-        commit_message: 'bke fence sec02',
+        commit_message: fenceMsg('att-sec02'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceSec02.ok, true);
 
-    const claimOk = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'CONSUME_SEND_CLAIM',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02',
-        ref_name: `refs/bke/claims/${PR_NUM}/att-sec02`,
-      }),
-      ledger_op: {
+    const claimOk = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'CONSUME_SEND_CLAIM',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -600,8 +538,8 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         ref_name: `refs/bke/claims/${PR_NUM}/att-sec02`,
         commit_message: 'bke claim',
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(claimOk.ok, true);
     assert.equal(claimOk.status, 'COMMITTED');
 
@@ -653,23 +591,8 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         }),
       /BROKER_TICKET_INVALID_OR_AMBIGUOUS/,
     );
-    const fenceDup = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02-dup',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-dup`,
-      }),
-      ledger_op: {
+    const fenceDup = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -679,29 +602,14 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02-dup',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-dup`,
-        commit_message: 'bke fence dup',
+        commit_message: fenceMsg('att-sec02-dup'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceDup.ok, true);
 
-    const dupClaim = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'CONSUME_SEND_CLAIM',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02-dup',
-        ref_name: `refs/bke/claims/${PR_NUM}/att-sec02-dup`,
-      }),
-      ledger_op: {
+    const dupClaim = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'CONSUME_SEND_CLAIM',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -713,29 +621,14 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         ref_name: `refs/bke/claims/${PR_NUM}/att-sec02-dup`,
         commit_message: 'bke claim',
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(dupClaim.ok, false);
     assert.equal(dupClaim.code, 'BROKER_TICKET_INVALID_OR_AMBIGUOUS');
 
     // 4. Fail-closed on missing total_count, malformed Link, and exceeded maxPages
-    const fenceMiss = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02-b',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-b`,
-      }),
-      ledger_op: {
+    const fenceMiss = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -745,29 +638,14 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02-b',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-b`,
-        commit_message: 'bke fence b',
+        commit_message: fenceMsg('att-sec02-b'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceMiss.ok, true);
     mockGh.state.missingCheckTotalCount = true;
-    const claimMissingTotal = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'CONSUME_SEND_CLAIM',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02-b',
-        ref_name: `refs/bke/claims/${PR_NUM}/att-sec02-b`,
-      }),
-      ledger_op: {
+    const claimMissingTotal = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'CONSUME_SEND_CLAIM',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -779,30 +657,15 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         ref_name: `refs/bke/claims/${PR_NUM}/att-sec02-b`,
         commit_message: 'bke claim',
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(claimMissingTotal.ok, false);
     assert.equal(claimMissingTotal.code, 'BROKER_PAGINATION_INCOMPLETE');
     mockGh.state.missingCheckTotalCount = false;
 
     mockGh.state.malformedPullsLink = true;
-    const malLink = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02-c',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-c`,
-      }),
-      ledger_op: {
+    const malLink = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -812,32 +675,17 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02-c',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-c`,
-        commit_message: 'bke fence',
+        commit_message: fenceMsg('att-sec02-c'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(malLink.ok, false);
     assert.equal(malLink.code, 'BROKER_GITHUB_PAGINATION_MALFORMED');
     mockGh.state.malformedPullsLink = false;
 
     mockGh.state.incompletePullsPagination = true;
-    const infLoop = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signer.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-sec02-d',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-d`,
-      }),
-      ledger_op: {
+    const infLoop = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signer, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -847,10 +695,10 @@ test('SEC-02: Complete pagination across /pulls, /check-runs, and /git/matching-
         head_sha: HEAD_A,
         attempt_id: 'att-sec02-d',
         ref_name: `refs/bke/fences/${PR_NUM}/att-sec02-d`,
-        commit_message: 'bke fence',
+        commit_message: fenceMsg('att-sec02-d'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(infLoop.ok, false);
     assert.equal(infLoop.code, 'BROKER_PAGINATION_INCOMPLETE');
   } finally {
@@ -917,11 +765,19 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
       purpose: 'SERVER_MEDIATED_LEDGER_OP',
       repository: REPO_1,
       nowMs: now,
-      ledger_op: 'COMMIT_PRE_SEND_FENCE',
-      pr_number: PR_NUM,
-      head_sha: HEAD_A,
-      attempt_id: 'att-sec03-a',
-      ref_name: `refs/bke/fences/${PR_NUM}/att-sec03-a`,
+      ledger_op: {
+        operation: 'COMMIT_PRE_SEND_FENCE',
+        repository: REPO_1,
+        repository_id: REPO_1_ID,
+        installation_id: INSTALL_ID,
+        worker_id: WORKER_A,
+        pr_number: PR_NUM,
+        head_sha: HEAD_A,
+        attempt_id: 'att-sec03-a',
+        ref_name: `refs/bke/fences/${PR_NUM}/att-sec03-a`,
+        commit_message: fenceMsg('att-sec03-a'),
+        tree_sha: TREE_A,
+      },
     });
     const replayRes = await broker.executeServerMediatedLedgerOp({
       worker_id: WORKER_A,
@@ -945,23 +801,8 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
     assert.equal(mockGh.state.refs.size, 0);
 
     // 2. Un-fenced MARK_DELIVERY_UNCERTAIN rejected even with matching PoP
-    const unfencedUncertain = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signerA.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'MARK_DELIVERY_UNCERTAIN',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-never-fenced',
-        ref_name: `refs/bke/uncertain/${PR_NUM}/att-never-fenced`,
-      }),
-      ledger_op: {
+    const unfencedUncertain = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signerA, DEVICE_A, now, {
         operation: 'MARK_DELIVERY_UNCERTAIN',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -973,30 +814,15 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
         ref_name: `refs/bke/uncertain/${PR_NUM}/att-never-fenced`,
         commit_message: 'uncertain without fence',
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(unfencedUncertain.ok, false);
     assert.equal(unfencedUncertain.code, 'BROKER_LEDGER_FENCE_MISSING');
     assert.equal(mockGh.state.refs.size, 0);
 
     // 3. Worker B commits its own durable PRE_SEND_FENCE on PR #200; Worker A cannot quarantine PR #200
-    const fenceB = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_B,
-      device_assertion: signerB.signDeviceAssertion({
-        worker_id: WORKER_B,
-        device_id: DEVICE_B,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_B,
-        head_sha: HEAD_A,
-        attempt_id: 'att-worker-b',
-        ref_name: `refs/bke/fences/${PR_B}/att-worker-b`,
-      }),
-      ledger_op: {
+    const fenceB = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signerB, DEVICE_B, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -1006,36 +832,14 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
         head_sha: HEAD_A,
         attempt_id: 'att-worker-b',
         ref_name: `refs/bke/fences/${PR_B}/att-worker-b`,
-        commit_message: JSON.stringify({
-          bkeEvent: 'PRE_SEND_FENCE',
-          version: 1,
-          fenceId: 'fence-b-1',
-          attemptId: 'att-worker-b',
-          workerId: WORKER_B,
-          headSha: HEAD_A,
-        }),
+        commit_message: fenceMsg('att-worker-b', WORKER_B, HEAD_A, 'fence-b-1'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceB.ok, true);
 
-    const crossWorkerSabotage = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signerA.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'MARK_DELIVERY_UNCERTAIN',
-        pr_number: PR_B,
-        head_sha: HEAD_A,
-        attempt_id: 'att-worker-b',
-        ref_name: `refs/bke/uncertain/${PR_B}/att-worker-b`,
-      }),
-      ledger_op: {
+    const crossWorkerSabotage = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signerA, DEVICE_A, now, {
         operation: 'MARK_DELIVERY_UNCERTAIN',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -1047,30 +851,15 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
         ref_name: `refs/bke/uncertain/${PR_B}/att-worker-b`,
         commit_message: 'sabotage B',
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(crossWorkerSabotage.ok, false);
     assert.equal(crossWorkerSabotage.code, 'BROKER_LEDGER_UNCERTAIN_OWNERSHIP_CONFLICT');
     assert.equal(mockGh.state.refs.has(`${REPO_1}:refs/bke/uncertain/${PR_B}/att-worker-b`), false);
 
     // 4. Legitimate Worker A commits its PRE_SEND_FENCE, PR advances & unlabels mid-flight -> MARK_DELIVERY_UNCERTAIN still succeeds!
-    const fenceA = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signerA.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'COMMIT_PRE_SEND_FENCE',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-worker-a',
-        ref_name: `refs/bke/fences/${PR_NUM}/att-worker-a`,
-      }),
-      ledger_op: {
+    const fenceA = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signerA, DEVICE_A, now, {
         operation: 'COMMIT_PRE_SEND_FENCE',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -1080,38 +869,16 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
         head_sha: HEAD_A,
         attempt_id: 'att-worker-a',
         ref_name: `refs/bke/fences/${PR_NUM}/att-worker-a`,
-        commit_message: JSON.stringify({
-          bkeEvent: 'PRE_SEND_FENCE',
-          version: 1,
-          fenceId: 'fence-a-1',
-          attemptId: 'att-worker-a',
-          workerId: WORKER_A,
-          headSha: HEAD_A,
-        }),
+        commit_message: fenceMsg('att-worker-a', WORKER_A, HEAD_A, 'fence-a-1'),
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(fenceA.ok, true);
 
     mockGh.state.repos[0].prs[0].headSha = HEAD_B;
     mockGh.state.repos[0].prs[0].labels = [];
-    const safeUncertain = await broker.executeServerMediatedLedgerOp({
-      worker_id: WORKER_A,
-      device_assertion: signerA.signDeviceAssertion({
-        worker_id: WORKER_A,
-        device_id: DEVICE_A,
-        installation_id: INSTALL_ID,
-        enrollment_generation: 1,
-        purpose: 'SERVER_MEDIATED_LEDGER_OP',
-        repository: REPO_1,
-        nowMs: now,
-        ledger_op: 'MARK_DELIVERY_UNCERTAIN',
-        pr_number: PR_NUM,
-        head_sha: HEAD_A,
-        attempt_id: 'att-worker-a',
-        ref_name: `refs/bke/uncertain/${PR_NUM}/att-worker-a`,
-      }),
-      ledger_op: {
+    const safeUncertain = await broker.executeServerMediatedLedgerOp(
+      signedLedgerCall(signerA, DEVICE_A, now, {
         operation: 'MARK_DELIVERY_UNCERTAIN',
         repository: REPO_1,
         repository_id: REPO_1_ID,
@@ -1123,8 +890,8 @@ test('SEC-03: Device PoP ledger-target binding and durable PRE_SEND_FENCE proof 
         ref_name: `refs/bke/uncertain/${PR_NUM}/att-worker-a`,
         commit_message: 'uncertain after send failure',
         tree_sha: TREE_A,
-      },
-    });
+      }),
+    );
     assert.equal(safeUncertain.ok, true);
     assert.equal(safeUncertain.status, 'COMMITTED');
     assert.equal(mockGh.state.refs.has(`${REPO_1}:refs/bke/uncertain/${PR_NUM}/att-worker-a`), true);

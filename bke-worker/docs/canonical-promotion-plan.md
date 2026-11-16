@@ -1,12 +1,12 @@
 # Canonical Promotion Plan (`jan2xo/bke-worker-h` -> `jan2xo/bke-worker`)
 
-This document reconciles the completed **F1 + F2 + F3 + F4 + F4.1 + F4.2 + F4.3** BKE Desktop Worker implementation in `jan2xo/bke-worker-h` against the canonical governance gates enforced by `jan2xo/bke-worker/.github/workflows/pr-guard.yml` (Issue `#149`).
+This document reconciles the completed **F1 + F2 + F3 + F4 + F4.1 + F4.2 + F4.3 + F4.3.1** BKE Desktop Worker implementation in `jan2xo/bke-worker-h` against the canonical governance gates enforced by `jan2xo/bke-worker/.github/workflows/pr-guard.yml` (Issue `#149`).
 
 > **Governance Reminder:** Do **NOT** open, merge, or reuse any oversized omnibus PR against `jan2xo/bke-worker` during sandbox engineering. Each canonical promotion PR requires an open `bke:mvp`-labeled GitHub issue referenced via `MVP-Task: #<issue>` in the PR body.
 
 ---
 
-## 1. Exact `pr-guard.yml` Rules Reconciled Against Measured F1–F4.3 Source
+## 1. Exact `pr-guard.yml` Rules Reconciled Against Measured F1–F4.3.1 Source
 
 Inspecting canonical `bke-worker/.github/workflows/pr-guard.yml` (lines 250–376) establishes five hard gates:
 
@@ -34,19 +34,19 @@ Inspecting canonical `bke-worker/.github/workflows/pr-guard.yml` (lines 250–37
 
 ## 2. Measured File Sizes & Required Splitting Before Sub-500-Line PR Submission
 
-Measured via `wc -l` on current verified F1+F2+F3+F4+F4.1+F4.2+F4.3 source:
+Measured via `wc -l` on current verified F1+F2+F3+F4+F4.1+F4.2+F4.3+F4.3.1 source:
 
 ### 2.1 Oversized Modules (`> 500` lines each in `jan2xo/bke-worker-h`)
 The following modules currently exceed 500 lines individually and therefore **either require file-splitting into `<= 450`-line modules before opening canonical PRs OR owner label `bke:oversize-ok`**:
 
-| File (`bke-worker/...`) | Measured Lines | F4–F4.3 Change Scope | Recommended Sub-500-Line Split (or `bke:oversize-ok`) |
+| File (`bke-worker/...`) | Measured Lines | F4–F4.3.1 Change Scope | Recommended Sub-500-Line Split (or `bke:oversize-ok`) |
 |---|---:|---|---|
 | `browser-extension/src/service-worker.ts` | 530 | Baseline F1 delta (+187) | Fits PR diff budget (`<= 187` added lines on existing baseline file). |
 | `browser-extension/src/controller-transport.ts` | 860 | F1/F2 | Split P-256 handshake (`controller-handshake.ts`, ~350) + router (`controller-transport.ts`, ~450). |
 | `browser-extension/native-host/claim/github-f1-ledger.ts` | 1,299 | F4 added `mediatedLedgerClient` across all 4 CAS ops & `forbidDesktopWriteToken` (+187) | Split mediated/REST CAS helpers (`github-ledger-cas.ts`, ~430), authority (~430), receipt builders (~430). |
 | `browser-extension/native-host/claim/desktop-controller.ts` | 975 | F1/F2 | Split `FileExecutionJournal` + POSIX lock (`file-execution-journal.ts`, ~390) from `DesktopController` (~480). |
 | `browser-extension/native-host/claim/controller-daemon.ts` | 1,459 | F4/F4.1 added strict V2 isolation, `503`/`403`/`401` error mapping, `mediatedCasEnabled`, and `runCli('start')` runtime wiring (+215) | Split HTTP route handler (`daemon-http-routes.ts`, ~440), CLI/doctor (`daemon-cli.ts`, ~480), core daemon (~480). |
-| `browser-extension/native-host/claim/runtime-broker-factory.ts` | 1,201 | F4.1–F4.3 signed authority/schema/replay/ledger-PoP/token status (`EXPIRED`/`UNKNOWN`) validation | Split credentials loader (`device-credentials-loader.ts`, ~325), payload validators (`broker-status-validators.ts`, ~400), HTTP client + factory (~475). |
+| `browser-extension/native-host/claim/runtime-broker-factory.ts` | 1,263 | F4.1–F4.3.1 signed authority/schema/replay/14-field ledger-PoP digest/token status validation | Split credentials loader (`device-credentials-loader.ts`, ~325), payload validators (`broker-status-validators.ts`, ~400), HTTP client + factory (~490). |
 | `browser-extension/native-host/claim/github-app-harness.ts` | 821 | F4 + F4.2 strict `ACTIVE` requirement, V2 strict config guards, mandatory tri-state `deviceRevocationChecker`, exact `expectedEnrollmentGeneration` | Split V1/V2 cryptographic verifiers (`envelope-crypto.ts`, ~360) + `ExecutionRequestVerifier` (~460). |
 | `browser-extension/native-host/claim/github-authority-provider.ts` | 545 | F3 | Extract pagination + permission validators (`github-authority-validators.ts`, ~180) -> core ~365 lines. |
 | `browser-extension/native-host/claim/token-lifecycle.ts` | 558 | F4–F4.3 fail-closed revocation (`EXPIRED`/`UNKNOWN`), `usageExpiresAtMs`/`providerExpiresAtMs`, required `repositoryId`, `+5s` skew | Split broker transport stubs/clampers (`token-broker-transport.ts`, ~170) -> provider ~390 lines. |
@@ -55,19 +55,20 @@ The following modules currently exceed 500 lines individually and therefore **ei
 | `browser-extension/native-host/claim/tests/runtime-wiring.test.mjs` | 1,063 | F4.1–F4.3 24-case signed device status + 12-case token status + daemon `503` test | Split fail-closed CLI startup (~350), error mapping (~350), and F4.2/F4.3 signed-matrix tests (~365). |
 | `browser-extension/native-host/claim/tests/reliability-adversarial.test.mjs` | 986 | F1/F2 | Split Groups 1–3 (~440), Groups 4–5 (~300), Groups 6–7 (~320). |
 | `browser-extension/native-host/claim/tests/e2e-two-turn-acceptance.test.mjs` | 1,111 | F1/F2 | Keep webhook 2-turn (~480), crash/drift (~180), signed V1 E2E (~450) in separate files. |
-| `integrations/desktop-broker/src/broker-client.ts` | 780 | F4–F4.3 signed status/token/mint/ledger PoP identity & schema hardening | Extract signed-status schema validators (`broker-status-validators.ts`, ~350) -> client ~430 lines. |
-| `integrations/desktop-broker/src/device-enrollment.ts` | 777 | F4–F4.3 strict 9-key/14-key assertion & `inspectDeviceStatus` param checks | Extract `signAdminApproval`/`verifyAdminApproval` (`admin-approval.ts`, ~260) -> registry ~515 (or further split). |
-| `integrations/desktop-broker/src/github-app-adapter.ts` | 1,236 | F4–F4.3 4-op server CAS, installation-wide read exclusivity, full pagination/`total_count`, `DELETE /installation/token`, `PRE_SEND_FENCE` proof | Extract pagination/authority readers (`github-authority-readers.ts`, ~350) and server CAS helper (`server-ledger-ops.ts`, ~430) -> adapter ~460 lines. |
-| `integrations/desktop-broker/src/broker-service.ts` | 997 | F4–F4.3 `usedStatusNonces`, `issuedTokens` registry, ledger-target PoP match, `EXPIRED`/`UNKNOWN`, provider revocation | Extract key-ring & status signers (`broker-keystore.ts`, ~450) -> service ~550 (or split token registry). |
-| `integrations/desktop-broker/tests/broker-service.test.mjs` | 765 | F4–F4.3 updated for `contents: read` desktop tokens & ledger PoP bindings | Split broker tests (#1–14, ~450) and rotation/CAS/F3-05 tests (#15–17, ~315). |
+| `integrations/desktop-broker/src/broker-client.ts` | 777 | F4–F4.3.1 signed status/token/mint/14-field ledger-PoP digest & schema hardening | Extract signed-status schema validators (`broker-status-validators.ts`, ~350) -> client ~430 lines. |
+| `integrations/desktop-broker/src/device-enrollment.ts` | 758 | F4–F4.3.1 strict 9-key/10-key (`ledger_op_sha256`) assertion & `inspectDeviceStatus` param checks | Extract `signAdminApproval`/`verifyAdminApproval` (`admin-approval.ts`, ~260) -> registry ~498 lines. |
+| `integrations/desktop-broker/src/github-app-adapter.ts` | 1,309 | F4–F4.3.1 4-op server CAS, fail-closed repo enumeration (`total_count`), full pagination, `DELETE /installation/token`, strict `PRE_SEND_FENCE` | Extract pagination/authority readers (`github-authority-readers.ts`, ~380) and server CAS helper (`server-ledger-ops.ts`, ~460) -> adapter ~470 lines. |
+| `integrations/desktop-broker/src/broker-service.ts` | 1,002 | F4–F4.3.1 `usedStatusNonces`, `issuedTokens` registry, pre-nonce 14-field `ledger_op_sha256` verification, `EXPIRED`/`UNKNOWN`, provider revocation | Extract key-ring & status signers (`broker-keystore.ts`, ~450) -> service ~550 (or split token registry). |
+| `integrations/desktop-broker/tests/broker-service.test.mjs` | 775 | F4–F4.3.1 updated for `contents: read`, canonical digest PoP, & structured `PRE_SEND_FENCE` | Split broker tests (#1–14, ~450) and rotation/CAS/F3-05 tests (#15–17, ~325). |
 | `integrations/desktop-broker/tests/multiprocess-e2e.test.mjs` | 729 | F4 mediated CAS & revocation HTTP assertions (+36) | Move child-process spawner helpers into shared fixture (~250) -> E2E ~480 lines. |
 | `integrations/desktop-broker/tests/cli-operational-e2e.test.mjs` | 1,121 | F4.1 + F4.2 `controller:cli start` 3-process E2E + signed omit-repo `503` -> Turn 1/2 | Split F4.1 Turn 1/2 + outage (~450), quarantine/revocation (~250), and F4.2 omit-repo (~425). |
-| `integrations/desktop-broker/tests/chaos-adversarial.test.mjs` | 780 | F4–F4.3 mediated CAS, `forbidDesktopWriteToken`, & ledger PoP updates | Split scenarios #1–9 (~390) and #10–18 (~390). |
-| `integrations/desktop-broker/tests/mediated-cas.test.mjs` | 809 | F4–F4.3 validly re-signed status fault matrix, replay/no-nonce, & fenced `MARK_DELIVERY_UNCERTAIN` | Split signed HTTP revocation matrix (~440) and 4-op CAS tests (~370). |
-| `integrations/desktop-broker/tests/multihost-safety.test.mjs` | 607 | F4–F4.3 multi-host race/rotation/quarantine + ledger PoP | Split race/rotation (~300) and quarantine/Turn2 CAS (~310). |
-| `integrations/desktop-broker/tests/f4-3-security-remediation.test.mjs` | 1,316 | New in F4.3 (`SEC-01`..`SEC-05` adversarial verification) | Split into per-finding suites (`sec01-02`, `sec03`, `sec04-05`, each `~330..450` lines). |
+| `integrations/desktop-broker/tests/chaos-adversarial.test.mjs` | 777 | F4–F4.3.1 mediated CAS, `forbidDesktopWriteToken`, canonical PoP, & structured fence updates | Split scenarios #1–9 (~390) and #10–18 (~390). |
+| `integrations/desktop-broker/tests/mediated-cas.test.mjs` | 816 | F4–F4.3.1 validly re-signed status fault matrix, replay/no-nonce, & structured fenced `MARK_DELIVERY_UNCERTAIN` | Split signed HTTP revocation matrix (~440) and 4-op CAS tests (~380). |
+| `integrations/desktop-broker/tests/multihost-safety.test.mjs` | 618 | F4–F4.3.1 multi-host race/rotation/quarantine + canonical ledger PoP & structured fence | Split race/rotation (~305) and quarantine/Turn2 CAS (~315). |
+| `integrations/desktop-broker/tests/f4-3-security-remediation.test.mjs` | 1,083 | F4.3 (`SEC-01`..`SEC-05` adversarial verification, updated for canonical PoP & strict fence) | Split into per-finding suites (`sec01-02`, `sec03`, `sec04-05`, each `~300..420` lines). |
+| `integrations/desktop-broker/tests/f4-3-1-security-remediation.test.mjs` | 822 | New in F4.3.1 (`SEC-06` 14-field digest + strict fence, `SEC-07` 2-repo fail-closed enumeration) | Split `sec06-digest-fence.test.mjs` (~490) and `sec07-repo-enum.test.mjs` (~300). |
 
-*(All other F3/F4/F4.3 files—`f3-hardening.test.mjs` [457], `command-center-observer.ts` [408], `broker-server.ts` [345], `types.ts` [244], `mock-github-server.mjs` [421], `helpers/controller-runner.mjs` [113], `device-enrollment.test.mjs` [446], `deploy/desktop-controller.env.example` [71], `scripts/package-desktop-worker.sh` [307], `docs/F4_SECURITY_REVIEW_PACKAGE.md` [116]—already sit cleanly below 500 lines.)*
+*(All other F3/F4/F4.3.1 files—`f3-hardening.test.mjs` [457], `command-center-observer.ts` [408], `broker-server.ts` [345], `types.ts` [357], `mock-github-server.mjs` [458], `helpers/controller-runner.mjs` [113], `device-enrollment.test.mjs` [446], `deploy/desktop-controller.env.example` [71], `scripts/package-desktop-worker.sh` [307], `docs/F4_SECURITY_REVIEW_PACKAGE.md` [116]—already sit cleanly below 500 lines.)*
 
 ---
 

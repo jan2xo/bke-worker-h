@@ -37,6 +37,7 @@ import {
 const DEVICE_POP_DOMAIN = 'BKE_DESKTOP_DEVICE_POP_V1\n';
 const DEVICE_STATUS_DOMAIN = 'BKE_DEVICE_STATUS_V1\n';
 const TOKEN_STATUS_DOMAIN = 'BKE_TOKEN_STATUS_V1\n';
+const LEDGER_OP_DIGEST_DOMAIN = 'BKE_MEDIATED_LEDGER_OP_V1\n';
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const WORKER_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -94,6 +95,76 @@ const ALLOWED_MEDIATED_OPS = new Set([
   'RECONCILE_CONVERSATION',
   'MARK_DELIVERY_UNCERTAIN',
 ]);
+
+function computeLedgerOpDigestHex(op: {
+  operation: ServerMediatedLedgerOpInput['operation'];
+  repository: string;
+  repository_id: number;
+  installation_id: string;
+  worker_id: string;
+  pr_number: number;
+  head_sha: string;
+  attempt_id: string;
+  ref_name: string;
+  turn_ref_name?: string;
+  expected_parent_sha?: string;
+  is_continuation?: boolean;
+  commit_message: string;
+  tree_sha: string;
+}): string {
+  if (
+    !ALLOWED_MEDIATED_OPS.has(op.operation) ||
+    typeof op.repository !== 'string' ||
+    typeof op.repository_id !== 'number' ||
+    !Number.isSafeInteger(op.repository_id) ||
+    typeof op.installation_id !== 'string' ||
+    typeof op.worker_id !== 'string' ||
+    op.worker_id.length === 0 ||
+    typeof op.pr_number !== 'number' ||
+    !Number.isSafeInteger(op.pr_number) ||
+    typeof op.head_sha !== 'string' ||
+    typeof op.attempt_id !== 'string' ||
+    typeof op.ref_name !== 'string' ||
+    typeof op.commit_message !== 'string' ||
+    typeof op.tree_sha !== 'string'
+  ) {
+    throw Error('BROKER_LEDGER_OP_INVALID');
+  }
+  if (
+    op.turn_ref_name !== undefined &&
+    (typeof op.turn_ref_name !== 'string' || op.turn_ref_name.length === 0)
+  ) {
+    throw Error('BROKER_LEDGER_OP_INVALID');
+  }
+  if (
+    op.expected_parent_sha !== undefined &&
+    (typeof op.expected_parent_sha !== 'string' || op.expected_parent_sha.length === 0)
+  ) {
+    throw Error('BROKER_LEDGER_OP_INVALID');
+  }
+  if (op.is_continuation !== undefined && typeof op.is_continuation !== 'boolean') {
+    throw Error('BROKER_LEDGER_OP_INVALID');
+  }
+  const canonical = {
+    attempt_id: op.attempt_id,
+    commit_message: op.commit_message,
+    expected_parent_sha: op.expected_parent_sha === undefined ? null : op.expected_parent_sha,
+    head_sha: op.head_sha,
+    installation_id: op.installation_id,
+    is_continuation: op.is_continuation === undefined ? null : op.is_continuation,
+    operation: op.operation,
+    pr_number: op.pr_number,
+    ref_name: op.ref_name,
+    repository: op.repository,
+    repository_id: op.repository_id,
+    tree_sha: op.tree_sha,
+    turn_ref_name: op.turn_ref_name === undefined ? null : op.turn_ref_name,
+    worker_id: op.worker_id,
+  };
+  return createHash('sha256')
+    .update(LEDGER_OP_DIGEST_DOMAIN + JSON.stringify(canonical), 'utf8')
+    .digest('hex');
+}
 
 export interface OwnerDeviceCredentials {
   version: 1;
@@ -429,13 +500,7 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
   private signDevicePop(
     purpose: 'MINT_SCOPED_TOKEN' | 'SERVER_MEDIATED_LEDGER_OP',
     repository: string,
-    ledgerBind?: {
-      ledger_op: ServerMediatedLedgerOpInput['operation'];
-      pr_number: number;
-      head_sha: string;
-      attempt_id: string;
-      ref_name: string;
-    },
+    ledgerOpDigestHex?: string,
   ) {
     const now = this.nowMs();
     const payload: Record<string, unknown> = {
@@ -450,14 +515,10 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
       expires_at: new Date(now + 60_000).toISOString(),
     };
     if (purpose === 'SERVER_MEDIATED_LEDGER_OP') {
-      if (!ledgerBind) {
+      if (!ledgerOpDigestHex || !SHA256_HEX_RE.test(ledgerOpDigestHex)) {
         throw Error('DEVICE_ASSERTION_LEDGER_FIELDS_MISSING');
       }
-      payload.ledger_op = ledgerBind.ledger_op;
-      payload.pr_number = ledgerBind.pr_number;
-      payload.head_sha = ledgerBind.head_sha;
-      payload.attempt_id = ledgerBind.attempt_id;
-      payload.ref_name = ledgerBind.ref_name;
+      payload.ledger_op_sha256 = ledgerOpDigestHex;
     }
     const msg = Buffer.from(DEVICE_POP_DOMAIN + canonicalJson(payload), 'utf8');
     const sig = cryptoSign('sha256', msg, {
@@ -908,32 +969,33 @@ export class HttpTrustedBrokerClient implements TokenBrokerClient, ServerMediate
       return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }
 
-    const assertion = this.signDevicePop('SERVER_MEDIATED_LEDGER_OP', input.repository, {
-      ledger_op: input.operation,
+    const ledgerOp = {
+      operation: input.operation,
+      repository: input.repository,
+      repository_id: input.repositoryId,
+      installation_id: input.installationId,
+      worker_id: input.workerId,
       pr_number: input.prNumber,
       head_sha: input.headSha,
       attempt_id: input.attemptId,
       ref_name: input.refName,
-    });
+      ...(input.turnRefName !== undefined ? { turn_ref_name: input.turnRefName } : {}),
+      ...(input.expectedParentSha !== undefined ? { expected_parent_sha: input.expectedParentSha } : {}),
+      ...(input.isContinuation !== undefined ? { is_continuation: input.isContinuation } : {}),
+      commit_message: input.commitMessage,
+      tree_sha: input.treeSha,
+    };
+    let digestHex: string;
+    try {
+      digestHex = computeLedgerOpDigestHex(ledgerOp);
+    } catch {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
+    }
+    const assertion = this.signDevicePop('SERVER_MEDIATED_LEDGER_OP', input.repository, digestHex);
     const res = await this.postJsonWithTimeout('/v1/broker/ledger-ops', {
       worker_id: input.workerId,
       device_assertion: assertion,
-      ledger_op: {
-        operation: input.operation,
-        repository: input.repository,
-        repository_id: input.repositoryId,
-        installation_id: input.installationId,
-        worker_id: input.workerId,
-        pr_number: input.prNumber,
-        head_sha: input.headSha,
-        attempt_id: input.attemptId,
-        ref_name: input.refName,
-        ...(input.turnRefName ? { turn_ref_name: input.turnRefName } : {}),
-        ...(input.expectedParentSha ? { expected_parent_sha: input.expectedParentSha } : {}),
-        ...(input.isContinuation !== undefined ? { is_continuation: input.isContinuation } : {}),
-        commit_message: input.commitMessage,
-        tree_sha: input.treeSha,
-      },
+      ledger_op: ledgerOp,
     });
     if (!res.data) {
       return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_TRANSPORT_UNAVAILABLE' };

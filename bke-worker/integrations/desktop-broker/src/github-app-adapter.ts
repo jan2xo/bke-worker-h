@@ -33,6 +33,8 @@ export interface GitHubAppAdapterConfig {
   timeoutMs?: number;
   maxPages?: number;
   nowMs?: () => number;
+  /** Isolated test-fixture-only opt-in; never enabled in trusted operational paths. */
+  allowLegacyUnstructuredFenceForTests?: boolean;
 }
 
 export interface VerifiedBrokerAuthority {
@@ -57,6 +59,7 @@ export class SandboxGitHubAppAdapter {
   private readonly timeoutMs: number;
   private readonly maxPages: number;
   private readonly nowMs: () => number;
+  private readonly allowLegacyUnstructuredFenceForTests: boolean;
 
   constructor(config: GitHubAppAdapterConfig) {
     if (!Number.isSafeInteger(config.appId) || config.appId <= 0 || !config.appSlug) {
@@ -70,6 +73,7 @@ export class SandboxGitHubAppAdapter {
     this.timeoutMs = config.timeoutMs ?? 4_000;
     this.maxPages = config.maxPages ?? 5;
     this.nowMs = config.nowMs ?? (() => Date.now());
+    this.allowLegacyUnstructuredFenceForTests = config.allowLegacyUnstructuredFenceForTests === true;
 
     if (config.sandboxAppPrivateKeyPem) {
       this.signingPrivateKeyPem = config.sandboxAppPrivateKeyPem;
@@ -363,23 +367,50 @@ export class SandboxGitHubAppAdapter {
     let totalCount: number | null = null;
     const out: Array<{ id: number; full_name: string; permissions: Record<string, unknown> }> = [];
     const seenIds = new Set<number>();
+    const seenUrls = new Set<string>();
 
     while (nextUrl) {
+      if (seenUrls.has(nextUrl)) {
+        throw Error('BROKER_PAGINATION_INCOMPLETE');
+      }
+      seenUrls.add(nextUrl);
       pages += 1;
       if (pages > this.maxPages) throw Error('BROKER_PAGINATION_INCOMPLETE');
       const res = await this.httpJson('GET', nextUrl, token);
       if (res.status !== 200) throw Error(`BROKER_REPO_LIST_FAILED_${res.status}`);
-      const body = res.data as Record<string, unknown>;
-      if (!Array.isArray(body.repositories)) throw Error('BROKER_REPO_LIST_INVALID');
-      if (typeof body.total_count === 'number') {
-        if (totalCount !== null && body.total_count !== totalCount) {
-          throw Error('BROKER_PAGINATION_INCOMPLETE');
-        }
-        totalCount = body.total_count;
+      const rawBody = res.data;
+      if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+        throw Error('BROKER_REPO_LIST_INVALID');
       }
+      const body = rawBody as Record<string, unknown>;
+      if (!Array.isArray(body.repositories)) throw Error('BROKER_REPO_LIST_INVALID');
+      if (
+        typeof body.total_count !== 'number' ||
+        !Number.isSafeInteger(body.total_count) ||
+        body.total_count < 0
+      ) {
+        throw Error('BROKER_PAGINATION_INCOMPLETE');
+      }
+      if (totalCount !== null && body.total_count !== totalCount) {
+        throw Error('BROKER_PAGINATION_INCOMPLETE');
+      }
+      totalCount = body.total_count;
+
       for (const raw of body.repositories) {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+          throw Error('BROKER_REPO_ITEM_INVALID');
+        }
         const item = raw as Record<string, unknown>;
-        if (typeof item.id !== 'number' || typeof item.full_name !== 'string' || !item.permissions) {
+        if (
+          typeof item.id !== 'number' ||
+          !Number.isSafeInteger(item.id) ||
+          item.id < 1 ||
+          typeof item.full_name !== 'string' ||
+          !REPO_RE.test(item.full_name) ||
+          !item.permissions ||
+          typeof item.permissions !== 'object' ||
+          Array.isArray(item.permissions)
+        ) {
           throw Error('BROKER_REPO_ITEM_INVALID');
         }
         if (seenIds.has(item.id)) throw Error('BROKER_DUPLICATE_REPO');
@@ -393,7 +424,7 @@ export class SandboxGitHubAppAdapter {
       nextUrl = this.parseNextUrl(res.headers);
     }
 
-    if (totalCount !== null && out.length !== totalCount) {
+    if (totalCount === null || out.length !== totalCount) {
       throw Error('BROKER_PAGINATION_INCOMPLETE');
     }
     return out;
@@ -407,8 +438,11 @@ export class SandboxGitHubAppAdapter {
     let pages = 0;
     const out: Array<Record<string, unknown>> = [];
     const seenPrNumbers = new Set<number>();
+    const seenUrls = new Set<string>();
 
     while (nextUrl) {
+      if (seenUrls.has(nextUrl)) throw Error('BROKER_PAGINATION_INCOMPLETE');
+      seenUrls.add(nextUrl);
       pages += 1;
       if (pages > this.maxPages) throw Error('BROKER_PAGINATION_INCOMPLETE');
       const res = await this.httpJson('GET', nextUrl, token);
@@ -720,7 +754,10 @@ export class SandboxGitHubAppAdapter {
         if (
           msg === 'BROKER_PAGINATION_INCOMPLETE' ||
           msg === 'BROKER_GITHUB_PAGINATION_MALFORMED' ||
-          msg === 'BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN'
+          msg === 'BROKER_GITHUB_CROSS_ORIGIN_FORBIDDEN' ||
+          msg === 'BROKER_DUPLICATE_REPO' ||
+          msg === 'BROKER_REPO_LIST_INVALID' ||
+          msg === 'BROKER_REPO_ITEM_INVALID'
         ) {
           return { ok: false, code: msg };
         }
@@ -877,6 +914,59 @@ export class SandboxGitHubAppAdapter {
     return true;
   }
 
+  private validateFencePayloadMessage(req: ServerMediatedLedgerOpRequest): boolean {
+    if (this.allowLegacyUnstructuredFenceForTests) {
+      try {
+        const parsedFence = JSON.parse(req.commit_message) as unknown;
+        if (
+          parsedFence &&
+          typeof parsedFence === 'object' &&
+          !Array.isArray(parsedFence) &&
+          (parsedFence as Record<string, unknown>).bkeEvent === 'PRE_SEND_FENCE'
+        ) {
+          const pf = parsedFence as Record<string, unknown>;
+          if (
+            (req.worker_id && pf.workerId !== req.worker_id) ||
+            pf.attemptId !== req.attempt_id ||
+            pf.headSha !== req.head_sha
+          ) {
+            return false;
+          }
+        }
+        return true;
+      } catch {
+        return true;
+      }
+    }
+
+    let parsedFence: unknown;
+    try {
+      parsedFence = JSON.parse(req.commit_message);
+    } catch {
+      return false;
+    }
+    if (!parsedFence || typeof parsedFence !== 'object' || Array.isArray(parsedFence)) {
+      return false;
+    }
+    const pf = parsedFence as Record<string, unknown>;
+    if (
+      pf.bkeEvent !== 'PRE_SEND_FENCE' ||
+      pf.version !== 1 ||
+      typeof pf.fenceId !== 'string' ||
+      pf.fenceId.trim().length < 1 ||
+      typeof pf.attemptId !== 'string' ||
+      pf.attemptId !== req.attempt_id ||
+      typeof pf.headSha !== 'string' ||
+      pf.headSha !== req.head_sha ||
+      typeof pf.workerId !== 'string' ||
+      !WORKER_RE.test(pf.workerId) ||
+      (req.worker_id !== undefined && pf.workerId !== req.worker_id)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Server-Mediated GitHub CAS (F4 P0-03):
    * Eliminates `contents: write` installation tokens from the desktop worker by
@@ -1013,25 +1103,8 @@ export class SandboxGitHubAppAdapter {
       }
 
       if (req.operation === 'COMMIT_PRE_SEND_FENCE') {
-        try {
-          const parsedFence = JSON.parse(req.commit_message) as unknown;
-          if (
-            parsedFence &&
-            typeof parsedFence === 'object' &&
-            !Array.isArray(parsedFence) &&
-            (parsedFence as Record<string, unknown>).bkeEvent === 'PRE_SEND_FENCE'
-          ) {
-            const pf = parsedFence as Record<string, unknown>;
-            if (
-              (req.worker_id && pf.workerId !== req.worker_id) ||
-              pf.attemptId !== req.attempt_id ||
-              pf.headSha !== req.head_sha
-            ) {
-              return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_PAYLOAD_INVALID' };
-            }
-          }
-        } catch {
-          // Non-JSON legacy test commit messages allowed here; MARK_DELIVERY_UNCERTAIN requires structured PRE_SEND_FENCE JSON.
+        if (!this.validateFencePayloadMessage(req)) {
+          return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_FENCE_PAYLOAD_INVALID' };
         }
         const prCheck = await this.verifyMediatedPrAndNoUncertain(minted.token, req);
         if (!prCheck.ok) {

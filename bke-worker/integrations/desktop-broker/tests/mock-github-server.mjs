@@ -22,6 +22,13 @@ export async function startMockGitHubServer(initialConfig = {}) {
     forceStatus: null, // e.g. { pathIncludes: '/pulls', status: 503 }
     dropAfterMutateCount: 0, // Accept POST /git/refs or /git/commits then destroy socket!
     incompleteRepoPagination: false,
+    omitRepoTotalCount: false,
+    badRepoTotalCount: null,
+    mismatchedRepoTotalCount: null,
+    truncatedRepoPagination: false,
+    duplicateRepoId: false,
+    malformedRepoLink: false,
+    loopRepoLink: false,
     incompletePullsPagination: false,
     malformedPullsLink: false,
     incompleteCheckPagination: false,
@@ -198,6 +205,32 @@ export async function startMockGitHubServer(initialConfig = {}) {
       if (state.incompleteRepoPagination) {
         return send(200, { total_count: reposWithTokPerms.length + 3, repositories: reposWithTokPerms.slice(0, 1) });
       }
+      if (state.omitRepoTotalCount) {
+        return send(200, { repositories: reposWithTokPerms.slice(0, 1) });
+      }
+      if (state.badRepoTotalCount !== null) {
+        return send(200, { total_count: state.badRepoTotalCount, repositories: reposWithTokPerms.slice(0, 1) });
+      }
+      if (state.duplicateRepoId && reposWithTokPerms.length > 0) {
+        return send(200, { total_count: 2, repositories: [reposWithTokPerms[0], reposWithTokPerms[0]] });
+      }
+      if (state.truncatedRepoPagination && reposWithTokPerms.length > 1) {
+        return send(200, { total_count: reposWithTokPerms.length, repositories: [reposWithTokPerms[0]] });
+      }
+      if (state.malformedRepoLink && reposWithTokPerms.length > 0) {
+        return send(
+          200,
+          { total_count: reposWithTokPerms.length, repositories: [reposWithTokPerms[0]] },
+          { Link: `bad-repo-link-no-brackets; rel="next"` },
+        );
+      }
+      if (state.loopRepoLink && reposWithTokPerms.length > 0) {
+        return send(
+          200,
+          { total_count: reposWithTokPerms.length + 1, repositories: [reposWithTokPerms[0]] },
+          { Link: `<${baseUrl}/installation/repositories?per_page=100>; rel="next"` },
+        );
+      }
       if (reposWithTokPerms.length > 1 && page === 1) {
         return send(
           200,
@@ -206,7 +239,11 @@ export async function startMockGitHubServer(initialConfig = {}) {
         );
       }
       const slice = reposWithTokPerms.length > 1 ? reposWithTokPerms.slice(1) : reposWithTokPerms;
-      return send(200, { total_count: reposWithTokPerms.length, repositories: slice });
+      const reportedTotal =
+        page > 1 && state.mismatchedRepoTotalCount !== null
+          ? state.mismatchedRepoTotalCount
+          : reposWithTokPerms.length;
+      return send(200, { total_count: reportedTotal, repositories: slice });
     }
 
     // 4. Open PRs per repository: GET /repos/:owner/:repo/pulls

@@ -98,6 +98,22 @@ async function enrollDevice(registry, adminKeys, deviceId, signer, profileHash, 
 function makeMediatedClient(broker, signer, deviceId, generation, nowRef) {
   return {
     async executeLedgerOp(op) {
+      const ledgerOp = {
+        operation: op.operation,
+        repository: op.repository,
+        repository_id: op.repositoryId,
+        installation_id: op.installationId,
+        worker_id: op.workerId,
+        pr_number: op.prNumber,
+        head_sha: op.headSha,
+        attempt_id: op.attemptId,
+        ref_name: op.refName,
+        ...(op.turnRefName !== undefined ? { turn_ref_name: op.turnRefName } : {}),
+        ...(op.expectedParentSha !== undefined ? { expected_parent_sha: op.expectedParentSha } : {}),
+        ...(op.isContinuation !== undefined ? { is_continuation: op.isContinuation } : {}),
+        commit_message: op.commitMessage,
+        tree_sha: op.treeSha,
+      };
       return broker.executeServerMediatedLedgerOp({
         worker_id: op.workerId,
         device_assertion: signer.signDeviceAssertion({
@@ -108,28 +124,9 @@ function makeMediatedClient(broker, signer, deviceId, generation, nowRef) {
           purpose: 'SERVER_MEDIATED_LEDGER_OP',
           repository: op.repository,
           nowMs: nowRef(),
-          ledger_op: op.operation,
-          pr_number: op.prNumber,
-          head_sha: op.headSha,
-          attempt_id: op.attemptId,
-          ref_name: op.refName,
+          ledger_op: ledgerOp,
         }),
-        ledger_op: {
-          operation: op.operation,
-          repository: op.repository,
-          repository_id: op.repositoryId,
-          installation_id: op.installationId,
-          worker_id: op.workerId,
-          pr_number: op.prNumber,
-          head_sha: op.headSha,
-          attempt_id: op.attemptId,
-          ref_name: op.refName,
-          turn_ref_name: op.turnRefName,
-          expected_parent_sha: op.expectedParentSha,
-          is_continuation: op.isContinuation,
-          commit_message: op.commitMessage,
-          tree_sha: op.treeSha,
-        },
+        ledger_op: ledgerOp,
       });
     },
   };
@@ -220,7 +217,14 @@ test('F4-04: Multi-host concurrent claim race, stale generation lockout, uncerta
       headSha: HEAD_A,
       attemptId: 'att-race-1',
       refName: `refs/bke/fences/${PR_NUM}/att-race-1`,
-      commitMessage: 'fence host-a',
+      commitMessage: JSON.stringify({
+        bkeEvent: 'PRE_SEND_FENCE',
+        version: 1,
+        fenceId: 'fence-race-1',
+        attemptId: 'att-race-1',
+        workerId: WORKER,
+        headSha: HEAD_A,
+      }),
       treeSha: TREE_A,
     });
     assert.equal(fenceA.ok, true);
@@ -530,7 +534,14 @@ test('F4-04: Multi-host concurrent claim race, stale generation lockout, uncerta
       headSha: HEAD_A,
       attemptId: 'att-conv-1',
       refName: `refs/bke/fences/${PR_NUM}/att-conv-1`,
-      commitMessage: 'fence 1',
+      commitMessage: JSON.stringify({
+        bkeEvent: 'PRE_SEND_FENCE',
+        version: 1,
+        fenceId: 'fence-conv-1',
+        attemptId: 'att-conv-1',
+        workerId: WORKER,
+        headSha: HEAD_A,
+      }),
       treeSha: TREE_A,
     });
     await clientB.executeLedgerOp({

@@ -138,6 +138,22 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
 
     const mediatedLedgerClient = {
       async executeLedgerOp(op) {
+        const ledgerOp = {
+          operation: op.operation,
+          repository: op.repository,
+          repository_id: op.repositoryId,
+          installation_id: op.installationId,
+          worker_id: op.workerId,
+          pr_number: op.prNumber,
+          head_sha: op.headSha,
+          attempt_id: op.attemptId,
+          ref_name: op.refName,
+          ...(op.turnRefName !== undefined ? { turn_ref_name: op.turnRefName } : {}),
+          ...(op.expectedParentSha !== undefined ? { expected_parent_sha: op.expectedParentSha } : {}),
+          ...(op.isContinuation !== undefined ? { is_continuation: op.isContinuation } : {}),
+          commit_message: op.commitMessage,
+          tree_sha: op.treeSha,
+        };
         return broker.executeServerMediatedLedgerOp({
           worker_id: op.workerId,
           device_assertion: signer.signDeviceAssertion({
@@ -148,28 +164,9 @@ test('F3-07 & F3-05: 18 chaos scenarios + Claim/Receipt fail-closed verification
             purpose: 'SERVER_MEDIATED_LEDGER_OP',
             repository: op.repository,
             nowMs: now,
-            ledger_op: op.operation,
-            pr_number: op.prNumber,
-            head_sha: op.headSha,
-            attempt_id: op.attemptId,
-            ref_name: op.refName,
+            ledger_op: ledgerOp,
           }),
-          ledger_op: {
-            operation: op.operation,
-            repository: op.repository,
-            repository_id: op.repositoryId,
-            installation_id: op.installationId,
-            worker_id: op.workerId,
-            pr_number: op.prNumber,
-            head_sha: op.headSha,
-            attempt_id: op.attemptId,
-            ref_name: op.refName,
-            turn_ref_name: op.turnRefName,
-            expected_parent_sha: op.expectedParentSha,
-            is_continuation: op.isContinuation,
-            commit_message: op.commitMessage,
-            tree_sha: op.treeSha,
-          },
+          ledger_op: ledgerOp,
         });
       },
     };

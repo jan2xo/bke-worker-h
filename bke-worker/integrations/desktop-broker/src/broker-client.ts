@@ -18,10 +18,12 @@ import {
   DEVICE_STATUS_DOMAIN,
   ENROLLMENT_CHALLENGE_DOMAIN,
   TOKEN_STATUS_DOMAIN,
+  computeLedgerOpDigestHex,
   type DeviceRevocationStatus,
   type DeviceSignedAssertion,
   type DeviceSignedAssertionPayload,
   type EnrollmentChallengeRecord,
+  type ServerMediatedLedgerOpRequest,
   type ServerMediatedLedgerOpResult,
 } from './types.js';
 
@@ -101,11 +103,8 @@ export class DeviceKeyPairSigner {
     nowMs?: number;
     ttlMs?: number;
     nonce?: string;
-    ledger_op?: DeviceSignedAssertionPayload['ledger_op'];
-    pr_number?: number;
-    head_sha?: string;
-    attempt_id?: string;
-    ref_name?: string;
+    ledger_op?: ServerMediatedLedgerOpRequest;
+    ledger_op_sha256?: string;
   }): DeviceSignedAssertion {
     const now = params.nowMs ?? Date.now();
     const payload: DeviceSignedAssertionPayload = {
@@ -120,20 +119,16 @@ export class DeviceKeyPairSigner {
       expires_at: new Date(now + (params.ttlMs ?? 60_000)).toISOString(),
     };
     if (params.purpose === 'SERVER_MEDIATED_LEDGER_OP') {
-      if (
-        !params.ledger_op ||
-        typeof params.pr_number !== 'number' ||
-        !params.head_sha ||
-        !params.attempt_id ||
-        !params.ref_name
-      ) {
+      const digest =
+        typeof params.ledger_op_sha256 === 'string'
+          ? params.ledger_op_sha256
+          : params.ledger_op
+            ? computeLedgerOpDigestHex(params.ledger_op)
+            : '';
+      if (!SHA256_HEX_RE.test(digest)) {
         throw Error('DEVICE_ASSERTION_LEDGER_FIELDS_MISSING');
       }
-      payload.ledger_op = params.ledger_op;
-      payload.pr_number = params.pr_number;
-      payload.head_sha = params.head_sha;
-      payload.attempt_id = params.attempt_id;
-      payload.ref_name = params.ref_name;
+      payload.ledger_op_sha256 = digest;
     }
     const msg = Buffer.from(
       DEVICE_POP_DOMAIN + canonicalJson(payload as unknown as Record<string, unknown>),
@@ -712,39 +707,41 @@ export class SandboxHttpTokenBrokerClient {
     ) {
       return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }
-    const assertion = this.config.deviceSigner.signDeviceAssertion({
-      worker_id: input.workerId,
-      device_id: this.config.deviceId,
-      installation_id: input.installationId,
-      enrollment_generation: this.config.enrollmentGeneration,
-      purpose: 'SERVER_MEDIATED_LEDGER_OP',
+    const ledgerOp: ServerMediatedLedgerOpRequest = {
+      operation: input.operation,
       repository: input.repository,
-      ledger_op: input.operation,
+      repository_id: input.repositoryId,
+      installation_id: input.installationId,
+      worker_id: input.workerId,
       pr_number: input.prNumber,
       head_sha: input.headSha,
       attempt_id: input.attemptId,
       ref_name: input.refName,
-      nowMs: (this.config.nowMs ?? Date.now)(),
-    });
+      ...(input.turnRefName !== undefined ? { turn_ref_name: input.turnRefName } : {}),
+      ...(input.expectedParentSha !== undefined ? { expected_parent_sha: input.expectedParentSha } : {}),
+      ...(input.isContinuation !== undefined ? { is_continuation: input.isContinuation } : {}),
+      commit_message: input.commitMessage,
+      tree_sha: input.treeSha,
+    };
+    let assertion: DeviceSignedAssertion;
+    try {
+      assertion = this.config.deviceSigner.signDeviceAssertion({
+        worker_id: input.workerId,
+        device_id: this.config.deviceId,
+        installation_id: input.installationId,
+        enrollment_generation: this.config.enrollmentGeneration,
+        purpose: 'SERVER_MEDIATED_LEDGER_OP',
+        repository: input.repository,
+        ledger_op: ledgerOp,
+        nowMs: (this.config.nowMs ?? Date.now)(),
+      });
+    } catch {
+      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
+    }
     const res = await this.postJsonWithTimeout('/v1/broker/ledger-ops', {
       worker_id: input.workerId,
       device_assertion: assertion,
-      ledger_op: {
-        operation: input.operation,
-        repository: input.repository,
-        repository_id: input.repositoryId,
-        installation_id: input.installationId,
-        worker_id: input.workerId,
-        pr_number: input.prNumber,
-        head_sha: input.headSha,
-        attempt_id: input.attemptId,
-        ref_name: input.refName,
-        ...(input.turnRefName ? { turn_ref_name: input.turnRefName } : {}),
-        ...(input.expectedParentSha ? { expected_parent_sha: input.expectedParentSha } : {}),
-        ...(input.isContinuation !== undefined ? { is_continuation: input.isContinuation } : {}),
-        commit_message: input.commitMessage,
-        tree_sha: input.treeSha,
-      },
+      ledger_op: ledgerOp,
     });
     if (!res.data) {
       return { ok: false, status: 'UNCERTAIN', code: 'BROKER_LEDGER_TRANSPORT_UNAVAILABLE' };

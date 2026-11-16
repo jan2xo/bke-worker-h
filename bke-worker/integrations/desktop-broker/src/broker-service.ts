@@ -8,7 +8,7 @@
  *   enforces replay protection & signing key rotation, and emits V2 Ed25519 ExecutionRequestEnvelopeV2.
  * - Strictly separates EXECUTION keys from HALT keys and never leaks secrets in responses or audits.
  */
-import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign as cryptoSign, timingSafeEqual } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -20,6 +20,7 @@ import {
   DEVICE_STATUS_DOMAIN,
   EXECUTION_V2_DOMAIN,
   TOKEN_STATUS_DOMAIN,
+  computeLedgerOpDigestHex,
   type BrokerAuditEvent,
   type BrokerSigningKeyEntry,
   type DeviceSignedAssertion,
@@ -696,8 +697,12 @@ export class TrustedDesktopBroker {
     device_assertion: DeviceSignedAssertion;
     ledger_op: ServerMediatedLedgerOpRequest;
   }): Promise<ServerMediatedLedgerOpResult> {
-    if (!params.ledger_op || typeof params.ledger_op !== 'object' || Array.isArray(params.ledger_op)) {
-      return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
+    let expectedDigest: string;
+    try {
+      expectedDigest = computeLedgerOpDigestHex(params.ledger_op);
+    } catch (err) {
+      const code = err instanceof Error ? err.message : 'BROKER_LEDGER_OP_INVALID';
+      return { ok: false, status: 'CONFLICT', code };
     }
     if (!isValidRepoName(params.ledger_op.repository)) {
       return { ok: false, status: 'CONFLICT', code: 'BROKER_LEDGER_OP_INVALID' };
@@ -708,15 +713,15 @@ export class TrustedDesktopBroker {
       params.ledger_op.repository,
     );
     const pop = params.device_assertion.payload;
+    const actualDigest = pop.ledger_op_sha256 ?? '';
+    const digestMatch =
+      /^[a-f0-9]{64}$/.test(actualDigest) &&
+      timingSafeEqual(Buffer.from(actualDigest, 'hex'), Buffer.from(expectedDigest, 'hex'));
     if (
       device.worker_id !== params.worker_id ||
       device.installation_id !== params.ledger_op.installation_id ||
-      (params.ledger_op.worker_id !== undefined && params.ledger_op.worker_id !== params.worker_id) ||
-      pop.ledger_op !== params.ledger_op.operation ||
-      pop.pr_number !== params.ledger_op.pr_number ||
-      pop.head_sha !== params.ledger_op.head_sha ||
-      pop.attempt_id !== params.ledger_op.attempt_id ||
-      pop.ref_name !== params.ledger_op.ref_name
+      params.ledger_op.worker_id !== params.worker_id ||
+      !digestMatch
     ) {
       return { ok: false, status: 'CONFLICT', code: 'BROKER_DEVICE_SCOPE_MISMATCH' };
     }

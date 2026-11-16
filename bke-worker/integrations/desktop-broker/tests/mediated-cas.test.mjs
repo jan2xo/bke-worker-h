@@ -375,6 +375,26 @@ test('F4 P0-03: All 4 Server-Mediated GitHub CAS operations succeed without desk
     }
 
     // force: true rejected over HTTP
+    const forceBaseOp = {
+      operation: 'COMMIT_PRE_SEND_FENCE',
+      repository: REPO,
+      repository_id: REPO_ID,
+      installation_id: INSTALL_ID,
+      worker_id: WORKER,
+      pr_number: PR_NUM,
+      head_sha: HEAD_A,
+      attempt_id: 'att-force-1',
+      ref_name: `refs/bke/fences/${PR_NUM}/att-force-1`,
+      commit_message: JSON.stringify({
+        bkeEvent: 'PRE_SEND_FENCE',
+        version: 1,
+        fenceId: 'fence-force-1',
+        attemptId: 'att-force-1',
+        workerId: WORKER,
+        headSha: HEAD_A,
+      }),
+      tree_sha: TREE_A,
+    };
     const forceRes = await fetch(`http://127.0.0.1:${port}/v1/broker/ledger-ops`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -388,23 +408,10 @@ test('F4 P0-03: All 4 Server-Mediated GitHub CAS operations succeed without desk
           purpose: 'SERVER_MEDIATED_LEDGER_OP',
           repository: REPO,
           nowMs: now,
-          ledger_op: 'COMMIT_PRE_SEND_FENCE',
-          pr_number: PR_NUM,
-          head_sha: HEAD_A,
-          attempt_id: 'att-force-1',
-          ref_name: `refs/bke/fences/${PR_NUM}/att-force-1`,
+          ledger_op: forceBaseOp,
         }),
         ledger_op: {
-          operation: 'COMMIT_PRE_SEND_FENCE',
-          repository: REPO,
-          repository_id: REPO_ID,
-          installation_id: INSTALL_ID,
-          pr_number: PR_NUM,
-          head_sha: HEAD_A,
-          attempt_id: 'att-force-1',
-          ref_name: `refs/bke/fences/${PR_NUM}/att-force-1`,
-          commit_message: 'force',
-          tree_sha: TREE_A,
+          ...forceBaseOp,
           force: true,
         },
       }),
